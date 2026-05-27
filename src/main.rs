@@ -1,10 +1,9 @@
 use std::time::{Duration, Instant};
 
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Event, MouseButton, StartCause, WindowEvent};
+use winit::event::{ElementState, Event, StartCause, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
-use winit::window::{Fullscreen, Window, WindowBuilder};
+use winit::window::{Fullscreen, WindowBuilder};
 
 #[cfg(all(
     feature = "renderer-gl",
@@ -243,11 +242,6 @@ mod goop {
             }
         }
 
-        pub fn resize(&mut self, width: f64, height: f64) {
-            self.width = width;
-            self.height = height;
-        }
-
         pub fn advance(&mut self) {
             for layer in &mut self.layers {
                 for blob in &mut layer.blobs {
@@ -328,85 +322,11 @@ mod goop {
 }
 
 struct AppState {
-    titlebar_visible: bool,
     scene: goop::Scene,
 }
 
-const DOUBLE_CLICK_MAX: Duration = Duration::from_millis(500);
-const DOUBLE_CLICK_DISTANCE: f64 = 4.0;
-
-struct ClickTracker {
-    last_click: Option<(Instant, Option<(f64, f64)>)>,
-    last_cursor_pos: Option<(f64, f64)>,
-}
-
-impl ClickTracker {
-    fn new() -> Self {
-        Self {
-            last_click: None,
-            last_cursor_pos: None,
-        }
-    }
-
-    fn update_cursor(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
-        self.last_cursor_pos = Some((position.x, position.y));
-    }
-
-    fn register_click(&mut self) -> bool {
-        let now = Instant::now();
-        let pos = self.last_cursor_pos;
-        let mut is_double = false;
-
-        if let Some((last_time, last_pos)) = self.last_click
-            && now.duration_since(last_time) <= DOUBLE_CLICK_MAX
-        {
-            let within_distance = match (last_pos, pos) {
-                (Some((lx, ly)), Some((x, y))) => {
-                    let dx = lx - x;
-                    let dy = ly - y;
-                    dx * dx + dy * dy <= DOUBLE_CLICK_DISTANCE * DOUBLE_CLICK_DISTANCE
-                }
-                _ => true,
-            };
-            if within_distance {
-                is_double = true;
-            }
-        }
-
-        if is_double {
-            self.last_click = None;
-        } else {
-            self.last_click = Some((now, pos));
-        }
-
-        is_double
-    }
-}
-
-enum KeyboardAction {
-    None,
-    Redraw,
-    Exit,
-}
-
-fn handle_keyboard_input(event: &winit::event::KeyEvent, state: &mut AppState) -> KeyboardAction {
-    if event.state != ElementState::Pressed {
-        return KeyboardAction::None;
-    }
-
-    match &event.logical_key {
-        Key::Named(NamedKey::Escape) => KeyboardAction::Exit,
-        Key::Named(NamedKey::Space) => {
-            state.scene = goop::Scene::new(state.scene.width, state.scene.height);
-            KeyboardAction::Redraw
-        }
-        _ => KeyboardAction::None,
-    }
-}
-
-fn toggle_titlebar(window: &Window, state: &mut AppState) {
-    state.titlebar_visible = !state.titlebar_visible;
-    window.set_decorations(state.titlebar_visible);
+fn is_key_press(event: &winit::event::KeyEvent) -> bool {
+    event.state == ElementState::Pressed
 }
 
 fn main() {
@@ -518,12 +438,11 @@ mod gl_app {
         let mut canvas = Canvas::new(renderer).expect("Failed to create canvas");
 
         resize_canvas(&mut canvas, initial_size);
+        window.set_cursor_visible(false);
 
         let mut state = AppState {
-            titlebar_visible: true,
             scene: goop::Scene::new(initial_size.width as f64, initial_size.height as f64),
         };
-        let mut click_tracker = ClickTracker::new();
         let mut next_tick = Instant::now();
 
         event_loop
@@ -536,7 +455,7 @@ mod gl_app {
                         WindowEvent::Resized(size) => {
                             resize_surface(&gl_surface, &gl_context, size);
                             resize_canvas(&mut canvas, size);
-                            state.scene.resize(size.width as f64, size.height as f64);
+                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
                             window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -547,28 +466,18 @@ mod gl_app {
                             let _ = inner_size_writer.request_inner_size(size);
                             resize_surface(&gl_surface, &gl_context, size);
                             resize_canvas(&mut canvas, size);
-                            state.scene.resize(size.width as f64, size.height as f64);
+                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
                             window.request_redraw();
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
-                            match handle_keyboard_input(&event, &mut state) {
-                                KeyboardAction::Exit => elwt.exit(),
-                                KeyboardAction::Redraw => window.request_redraw(),
-                                KeyboardAction::None => {}
+                            if is_key_press(&event) {
+                                elwt.exit();
                             }
-                        }
-                        WindowEvent::CursorMoved { position, .. } => {
-                            click_tracker.update_cursor(position);
                         }
                         WindowEvent::MouseInput {
                             state: ElementState::Pressed,
-                            button: MouseButton::Left,
                             ..
-                        } => {
-                            if click_tracker.register_click() {
-                                toggle_titlebar(&window, &mut state);
-                            }
-                        }
+                        } => elwt.exit(),
                         WindowEvent::RedrawRequested => {
                             state.scene.advance();
                             let size = window.inner_size();
@@ -705,16 +614,15 @@ mod softbuffer_app {
             .build(&event_loop)
             .expect("Failed to create window");
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        window.set_cursor_visible(false);
         let window = Rc::new(window);
 
         let mut state = AppState {
-            titlebar_visible: true,
             scene: goop::Scene::new(
                 window.inner_size().width as f64,
                 window.inner_size().height as f64,
             ),
         };
-        let mut click_tracker = ClickTracker::new();
 
         let context = Context::new(window.clone()).expect("Failed to create softbuffer context");
         let mut surface = Surface::new(&context, window.clone()).expect("Failed to create surface");
@@ -748,7 +656,7 @@ mod softbuffer_app {
                                 .expect("Failed to resize surface");
                             pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
                                 .expect("Failed to create pixmap");
-                            state.scene.resize(size.width as f64, size.height as f64);
+                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
                             window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -766,28 +674,18 @@ mod softbuffer_app {
                                 .expect("Failed to resize surface");
                             pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
                                 .expect("Failed to create pixmap");
-                            state.scene.resize(size.width as f64, size.height as f64);
+                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
                             window.request_redraw();
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
-                            match handle_keyboard_input(&event, &mut state) {
-                                KeyboardAction::Exit => elwt.exit(),
-                                KeyboardAction::Redraw => window.request_redraw(),
-                                KeyboardAction::None => {}
+                            if is_key_press(&event) {
+                                elwt.exit();
                             }
-                        }
-                        WindowEvent::CursorMoved { position, .. } => {
-                            click_tracker.update_cursor(position);
                         }
                         WindowEvent::MouseInput {
                             state: ElementState::Pressed,
-                            button: MouseButton::Left,
                             ..
-                        } => {
-                            if click_tracker.register_click() {
-                                toggle_titlebar(&window, &mut state);
-                            }
-                        }
+                        } => elwt.exit(),
                         WindowEvent::RedrawRequested => {
                             state.scene.advance();
 
@@ -843,15 +741,14 @@ mod pixels_app {
             .build(&event_loop)
             .expect("Failed to create window");
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+        window.set_cursor_visible(false);
 
         let mut state = AppState {
-            titlebar_visible: true,
             scene: goop::Scene::new(
                 window.inner_size().width as f64,
                 window.inner_size().height as f64,
             ),
         };
-        let mut click_tracker = ClickTracker::new();
 
         let mut size = window.inner_size();
         let surface_texture = SurfaceTexture::new(size.width.max(1), size.height.max(1), &window);
@@ -871,7 +768,7 @@ mod pixels_app {
                             size = new_size;
                             let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
                             let _ = pixels.resize_buffer(size.width.max(1), size.height.max(1));
-                            state.scene.resize(size.width as f64, size.height as f64);
+                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
                             window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -883,28 +780,18 @@ mod pixels_app {
                             size = new_size;
                             let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
                             let _ = pixels.resize_buffer(size.width.max(1), size.height.max(1));
-                            state.scene.resize(size.width as f64, size.height as f64);
+                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
                             window.request_redraw();
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
-                            match handle_keyboard_input(&event, &mut state) {
-                                KeyboardAction::Exit => elwt.exit(),
-                                KeyboardAction::Redraw => window.request_redraw(),
-                                KeyboardAction::None => {}
+                            if is_key_press(&event) {
+                                elwt.exit();
                             }
-                        }
-                        WindowEvent::CursorMoved { position, .. } => {
-                            click_tracker.update_cursor(position);
                         }
                         WindowEvent::MouseInput {
                             state: ElementState::Pressed,
-                            button: MouseButton::Left,
                             ..
-                        } => {
-                            if click_tracker.register_click() {
-                                toggle_titlebar(&window, &mut state);
-                            }
-                        }
+                        } => elwt.exit(),
                         WindowEvent::RedrawRequested => {
                             state.scene.advance();
 
