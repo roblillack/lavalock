@@ -195,10 +195,8 @@ mod goop {
 
     impl Scene {
         pub fn new(width: f64, height: f64) -> Self {
-            // xscreensaver default: random nlayers in [2, depth-2]; with a 24-bit
-            // visual the practical range that still distributes the 12 blobs
-            // sensibly is 2..=6.
-            let nlayers = 2 + rng::range(5) as usize;
+            // xenocara default on a 24-bit visual: 2 + LRAND() % (depth - 2).
+            let nlayers = 2 + rng::range(22) as usize;
 
             // Integer-truncated sizes matching the C math.
             let blob_max = (width.min(height) * 0.5).floor();
@@ -352,7 +350,7 @@ mod gl_app {
     use std::num::NonZeroU32;
 
     use femtovg::renderer::OpenGl;
-    use femtovg::{Canvas, Color, CompositeOperation, Paint, Path};
+    use femtovg::{Canvas, Color, Paint, Path};
     use glutin::config::ConfigTemplateBuilder;
     use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
     use glutin::display::GetGlDisplay;
@@ -515,9 +513,7 @@ mod gl_app {
     }
 
     fn draw_scene(canvas: &mut Canvas<OpenGl>, scene: &goop::Scene, size: PhysicalSize<u32>) {
-        canvas.global_composite_operation(CompositeOperation::SourceOver);
         canvas.clear_rect(0, 0, size.width, size.height, Color::rgb(0, 0, 0));
-        canvas.global_composite_operation(CompositeOperation::Lighter);
 
         for layer in &scene.layers {
             let paint = Paint::color(Color::rgb(layer.color[0], layer.color[1], layer.color[2]));
@@ -543,8 +539,6 @@ mod gl_app {
                 canvas.fill_path(&path, &paint);
             }
         }
-
-        canvas.global_composite_operation(CompositeOperation::SourceOver);
     }
 }
 
@@ -552,7 +546,7 @@ mod gl_app {
 mod cpu_renderer {
     use super::*;
 
-    use tiny_skia::{BlendMode, Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
+    use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
 
     pub fn draw_scene(pixmap: &mut PixmapMut<'_>, scene: &goop::Scene) {
         pixmap.fill(Color::BLACK);
@@ -560,7 +554,6 @@ mod cpu_renderer {
         for layer in &scene.layers {
             let mut paint = Paint::default();
             paint.set_color_rgba8(layer.color[0], layer.color[1], layer.color[2], 255);
-            paint.blend_mode = BlendMode::Plus;
             paint.anti_alias = true;
 
             for blob in &layer.blobs {
