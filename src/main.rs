@@ -438,7 +438,7 @@ mod gl_app {
         let mut canvas = Canvas::new(renderer).expect("Failed to create canvas");
 
         resize_canvas(&mut canvas, initial_size);
-        window.set_cursor_visible(false);
+        window.set_cursor_visible(window.fullscreen().is_none());
 
         let mut state = AppState {
             scene: goop::Scene::new(initial_size.width as f64, initial_size.height as f64),
@@ -456,6 +456,7 @@ mod gl_app {
                             resize_surface(&gl_surface, &gl_context, size);
                             resize_canvas(&mut canvas, size);
                             state.scene = goop::Scene::new(size.width as f64, size.height as f64);
+                            window.set_cursor_visible(window.fullscreen().is_none());
                             window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -467,6 +468,7 @@ mod gl_app {
                             resize_surface(&gl_surface, &gl_context, size);
                             resize_canvas(&mut canvas, size);
                             state.scene = goop::Scene::new(size.width as f64, size.height as f64);
+                            window.set_cursor_visible(window.fullscreen().is_none());
                             window.request_redraw();
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
@@ -614,7 +616,7 @@ mod softbuffer_app {
             .build(&event_loop)
             .expect("Failed to create window");
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        window.set_cursor_visible(false);
+        window.set_cursor_visible(window.fullscreen().is_none());
         let window = Rc::new(window);
 
         let mut state = AppState {
@@ -657,6 +659,7 @@ mod softbuffer_app {
                             pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
                                 .expect("Failed to create pixmap");
                             state.scene = goop::Scene::new(size.width as f64, size.height as f64);
+                            window.set_cursor_visible(window.fullscreen().is_none());
                             window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -675,6 +678,7 @@ mod softbuffer_app {
                             pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
                                 .expect("Failed to create pixmap");
                             state.scene = goop::Scene::new(size.width as f64, size.height as f64);
+                            window.set_cursor_visible(window.fullscreen().is_none());
                             window.request_redraw();
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
@@ -741,7 +745,7 @@ mod pixels_app {
             .build(&event_loop)
             .expect("Failed to create window");
         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        window.set_cursor_visible(false);
+        window.set_cursor_visible(window.fullscreen().is_none());
 
         let mut state = AppState {
             scene: goop::Scene::new(
@@ -769,6 +773,7 @@ mod pixels_app {
                             let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
                             let _ = pixels.resize_buffer(size.width.max(1), size.height.max(1));
                             state.scene = goop::Scene::new(size.width as f64, size.height as f64);
+                            window.set_cursor_visible(window.fullscreen().is_none());
                             window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -781,6 +786,7 @@ mod pixels_app {
                             let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
                             let _ = pixels.resize_buffer(size.width.max(1), size.height.max(1));
                             state.scene = goop::Scene::new(size.width as f64, size.height as f64);
+                            window.set_cursor_visible(window.fullscreen().is_none());
                             window.request_redraw();
                         }
                         WindowEvent::KeyboardInput { event, .. } => {
