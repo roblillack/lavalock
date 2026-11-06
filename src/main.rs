@@ -609,15 +609,19 @@ mod goop {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("Unlocking is only implemented with Linux-PAM.");
+#[cfg(not(any(target_os = "linux", target_os = "openbsd")))]
+compile_error!("Unlocking is only implemented with Linux-PAM and BSD Authentication.");
 
 mod auth {
-    use std::ffi::{CStr, CString, c_char, c_int, c_void};
-    use std::path::Path;
+    use std::ffi::CStr;
     use std::sync::atomic::{Ordering, compiler_fence};
     use std::sync::mpsc::{self, Receiver};
     use std::{ptr, thread};
+
+    #[cfg(target_os = "openbsd")]
+    use bsd_auth::Backend;
+    #[cfg(target_os = "linux")]
+    use pam::Backend;
 
     /// Longest password we accept, in bytes. Allocating it all up front means
     /// the buffer never moves, so there are no stray copies to wipe.
@@ -671,183 +675,32 @@ mod auth {
         compiler_fence(Ordering::SeqCst);
     }
 
-    #[repr(C)]
-    struct PamHandle {
-        _private: [u8; 0],
-    }
-
-    #[repr(C)]
-    struct PamMessage {
-        msg_style: c_int,
-        msg: *const c_char,
-    }
-
-    #[repr(C)]
-    struct PamResponse {
-        resp: *mut c_char,
-        resp_retcode: c_int,
-    }
-
-    type ConvFn = unsafe extern "C" fn(
-        c_int,
-        *mut *const PamMessage,
-        *mut *mut PamResponse,
-        *mut c_void,
-    ) -> c_int;
-
-    #[repr(C)]
-    struct PamConv {
-        conv: Option<ConvFn>,
-        appdata_ptr: *mut c_void,
-    }
-
-    const PAM_SUCCESS: c_int = 0;
-    const PAM_BUF_ERR: c_int = 5;
-    const PAM_CONV_ERR: c_int = 19;
-    const PAM_REFRESH_CRED: c_int = 0x0010;
-    const PAM_PROMPT_ECHO_OFF: c_int = 1;
-    const PAM_PROMPT_ECHO_ON: c_int = 2;
-    const PAM_MAX_NUM_MSG: c_int = 32;
-
-    // Link the runtime library directly: the unversioned libpam.so only
-    // comes with the development package.
-    #[link(name = "libpam.so.0", kind = "dylib", modifiers = "+verbatim")]
-    unsafe extern "C" {
-        fn pam_start(
-            service_name: *const c_char,
-            user: *const c_char,
-            pam_conversation: *const PamConv,
-            pamh: *mut *mut PamHandle,
-        ) -> c_int;
-        fn pam_authenticate(pamh: *mut PamHandle, flags: c_int) -> c_int;
-        fn pam_setcred(pamh: *mut PamHandle, flags: c_int) -> c_int;
-        fn pam_end(pamh: *mut PamHandle, pam_status: c_int) -> c_int;
-    }
-
-    /// Answers PAM's prompts with the password `appdata` points to.
-    unsafe extern "C" fn converse(
-        num_msg: c_int,
-        msg: *mut *const PamMessage,
-        resp: *mut *mut PamResponse,
-        appdata: *mut c_void,
-    ) -> c_int {
-        if num_msg <= 0 || num_msg > PAM_MAX_NUM_MSG || appdata.is_null() {
-            return PAM_CONV_ERR;
-        }
-        let num_msg = num_msg as usize;
-        let password = unsafe { &*(appdata as *const Password) };
-
-        // PAM frees the replies with free(), so they must come from malloc.
-        let replies =
-            unsafe { libc::calloc(num_msg, size_of::<PamResponse>()) } as *mut PamResponse;
-        if replies.is_null() {
-            return PAM_BUF_ERR;
-        }
-        for i in 0..num_msg {
-            let style = unsafe { (**msg.add(i)).msg_style };
-            if style != PAM_PROMPT_ECHO_OFF && style != PAM_PROMPT_ECHO_ON {
-                continue;
-            }
-            let len = password.0.len();
-            let copy = unsafe { libc::malloc(len + 1) } as *mut u8;
-            if copy.is_null() {
-                unsafe { free_replies(replies, i) };
-                return PAM_BUF_ERR;
-            }
-            unsafe {
-                ptr::copy_nonoverlapping(password.0.as_ptr(), copy, len);
-                *copy.add(len) = 0;
-                (*replies.add(i)).resp = copy as *mut c_char;
-            }
-        }
-        unsafe { *resp = replies };
-        PAM_SUCCESS
-    }
-
-    /// Wipes and frees the first `n` replies and the array holding them.
-    unsafe fn free_replies(replies: *mut PamResponse, n: usize) {
-        for i in 0..n {
-            let reply = unsafe { (*replies.add(i)).resp };
-            if !reply.is_null() {
-                unsafe {
-                    let len = libc::strlen(reply);
-                    wipe(std::slice::from_raw_parts_mut(reply as *mut u8, len));
-                    libc::free(reply as *mut c_void);
-                }
-            }
-        }
-        unsafe { libc::free(replies as *mut c_void) };
-    }
-
     /// Checks passwords for the user running us.
     pub struct Authenticator {
-        service: CString,
-        user: CString,
+        backend: Backend,
     }
 
     impl Authenticator {
+        /// Fails if we couldn't check passwords, which is better found out
+        /// before locking the screen.
         pub fn new() -> Result<Self, String> {
             let pw = unsafe { libc::getpwuid(libc::getuid()) };
             if pw.is_null() {
                 return Err("cannot look up the current user".into());
             }
             let user = unsafe { CStr::from_ptr((*pw).pw_name) }.to_owned();
-            let auth = Self {
-                service: CString::new(service_name()).unwrap(),
-                user,
-            };
-            // Fail now rather than after locking the screen.
-            let password = Password::new();
-            match auth.start(&password) {
-                Ok(pamh) => {
-                    unsafe { pam_end(pamh, PAM_SUCCESS) };
-                    Ok(auth)
-                }
-                Err(err) => Err(format!("cannot initialize PAM (error {err})")),
-            }
+            Ok(Self {
+                backend: Backend::new(user)?,
+            })
         }
 
-        fn start(&self, password: &Password) -> Result<*mut PamHandle, c_int> {
-            let conv = PamConv {
-                conv: Some(converse),
-                appdata_ptr: password as *const Password as *mut c_void,
-            };
-            let mut pamh = ptr::null_mut();
-            // PAM copies the conversation struct, but not the password.
-            let ret =
-                unsafe { pam_start(self.service.as_ptr(), self.user.as_ptr(), &conv, &mut pamh) };
-            if ret == PAM_SUCCESS {
-                Ok(pamh)
-            } else {
-                Err(ret)
-            }
-        }
-
-        fn authenticate(&self, password: &Password) -> bool {
-            let Ok(pamh) = self.start(password) else {
-                return false;
-            };
-            unsafe {
-                let ret = pam_authenticate(pamh, 0);
-                if ret == PAM_SUCCESS {
-                    // Like other lockers, e.g. to renew Kerberos tickets.
-                    pam_setcred(pamh, PAM_REFRESH_CRED);
-                }
-                pam_end(pamh, ret);
-                ret == PAM_SUCCESS
-            }
-        }
-
-        /// Checks the password in the background, as PAM may take a while
-        /// (it usually delays failures on purpose).
+        /// Checks the password in the background, as that may take a while
+        /// (PAM usually delays failures on purpose).
         pub fn check(&self, password: Password) -> Receiver<bool> {
             let (tx, rx) = mpsc::channel();
-            let auth = Self {
-                service: self.service.clone(),
-                user: self.user.clone(),
-            };
+            let backend = self.backend.clone();
             thread::spawn(move || {
-                let ok = auth.authenticate(&password);
+                let ok = backend.authenticate(&password);
                 drop(password);
                 let _ = tx.send(ok);
             });
@@ -855,15 +708,257 @@ mod auth {
         }
     }
 
-    /// Our own PAM service if the system has one, otherwise "login", which
-    /// every distribution sets up for password logins. (The fallback for
-    /// unknown services, "other", denies everything on some.)
-    fn service_name() -> &'static str {
-        let ours = ["/etc/pam.d/lavalock", "/usr/lib/pam.d/lavalock"];
-        if ours.iter().any(|p| Path::new(p).exists()) {
-            "lavalock"
-        } else {
-            "login"
+    #[cfg(target_os = "linux")]
+    mod pam {
+        use std::ffi::{CString, c_char, c_int, c_void};
+        use std::path::Path;
+        use std::ptr;
+
+        use super::{Password, wipe};
+
+        #[repr(C)]
+        struct PamHandle {
+            _private: [u8; 0],
+        }
+
+        #[repr(C)]
+        struct PamMessage {
+            msg_style: c_int,
+            msg: *const c_char,
+        }
+
+        #[repr(C)]
+        struct PamResponse {
+            resp: *mut c_char,
+            resp_retcode: c_int,
+        }
+
+        type ConvFn = unsafe extern "C" fn(
+            c_int,
+            *mut *const PamMessage,
+            *mut *mut PamResponse,
+            *mut c_void,
+        ) -> c_int;
+
+        #[repr(C)]
+        struct PamConv {
+            conv: Option<ConvFn>,
+            appdata_ptr: *mut c_void,
+        }
+
+        const PAM_SUCCESS: c_int = 0;
+        const PAM_BUF_ERR: c_int = 5;
+        const PAM_CONV_ERR: c_int = 19;
+        const PAM_REFRESH_CRED: c_int = 0x0010;
+        const PAM_PROMPT_ECHO_OFF: c_int = 1;
+        const PAM_PROMPT_ECHO_ON: c_int = 2;
+        const PAM_MAX_NUM_MSG: c_int = 32;
+
+        // Link the runtime library directly: the unversioned libpam.so only
+        // comes with the development package.
+        #[link(name = "libpam.so.0", kind = "dylib", modifiers = "+verbatim")]
+        unsafe extern "C" {
+            fn pam_start(
+                service_name: *const c_char,
+                user: *const c_char,
+                pam_conversation: *const PamConv,
+                pamh: *mut *mut PamHandle,
+            ) -> c_int;
+            fn pam_authenticate(pamh: *mut PamHandle, flags: c_int) -> c_int;
+            fn pam_setcred(pamh: *mut PamHandle, flags: c_int) -> c_int;
+            fn pam_end(pamh: *mut PamHandle, pam_status: c_int) -> c_int;
+        }
+
+        /// Answers PAM's prompts with the password `appdata` points to.
+        unsafe extern "C" fn converse(
+            num_msg: c_int,
+            msg: *mut *const PamMessage,
+            resp: *mut *mut PamResponse,
+            appdata: *mut c_void,
+        ) -> c_int {
+            if num_msg <= 0 || num_msg > PAM_MAX_NUM_MSG || appdata.is_null() {
+                return PAM_CONV_ERR;
+            }
+            let num_msg = num_msg as usize;
+            let password = unsafe { &*(appdata as *const Password) };
+
+            // PAM frees the replies with free(), so they must come from malloc.
+            let replies =
+                unsafe { libc::calloc(num_msg, size_of::<PamResponse>()) } as *mut PamResponse;
+            if replies.is_null() {
+                return PAM_BUF_ERR;
+            }
+            for i in 0..num_msg {
+                let style = unsafe { (**msg.add(i)).msg_style };
+                if style != PAM_PROMPT_ECHO_OFF && style != PAM_PROMPT_ECHO_ON {
+                    continue;
+                }
+                let len = password.0.len();
+                let copy = unsafe { libc::malloc(len + 1) } as *mut u8;
+                if copy.is_null() {
+                    unsafe { free_replies(replies, i) };
+                    return PAM_BUF_ERR;
+                }
+                unsafe {
+                    ptr::copy_nonoverlapping(password.0.as_ptr(), copy, len);
+                    *copy.add(len) = 0;
+                    (*replies.add(i)).resp = copy as *mut c_char;
+                }
+            }
+            unsafe { *resp = replies };
+            PAM_SUCCESS
+        }
+
+        /// Wipes and frees the first `n` replies and the array holding them.
+        unsafe fn free_replies(replies: *mut PamResponse, n: usize) {
+            for i in 0..n {
+                let reply = unsafe { (*replies.add(i)).resp };
+                if !reply.is_null() {
+                    unsafe {
+                        let len = libc::strlen(reply);
+                        wipe(std::slice::from_raw_parts_mut(reply as *mut u8, len));
+                        libc::free(reply as *mut c_void);
+                    }
+                }
+            }
+            unsafe { libc::free(replies as *mut c_void) };
+        }
+
+        #[derive(Clone)]
+        pub struct Backend {
+            service: CString,
+            user: CString,
+        }
+
+        impl Backend {
+            pub fn new(user: CString) -> Result<Self, String> {
+                let backend = Self {
+                    service: CString::new(service_name()).unwrap(),
+                    user,
+                };
+                let password = Password::new();
+                match backend.start(&password) {
+                    Ok(pamh) => {
+                        unsafe { pam_end(pamh, PAM_SUCCESS) };
+                        Ok(backend)
+                    }
+                    Err(err) => Err(format!("cannot initialize PAM (error {err})")),
+                }
+            }
+
+            fn start(&self, password: &Password) -> Result<*mut PamHandle, c_int> {
+                let conv = PamConv {
+                    conv: Some(converse),
+                    appdata_ptr: password as *const Password as *mut c_void,
+                };
+                let mut pamh = ptr::null_mut();
+                // PAM copies the conversation struct, but not the password.
+                let ret = unsafe {
+                    pam_start(self.service.as_ptr(), self.user.as_ptr(), &conv, &mut pamh)
+                };
+                if ret == PAM_SUCCESS {
+                    Ok(pamh)
+                } else {
+                    Err(ret)
+                }
+            }
+
+            pub fn authenticate(&self, password: &Password) -> bool {
+                let Ok(pamh) = self.start(password) else {
+                    return false;
+                };
+                unsafe {
+                    let ret = pam_authenticate(pamh, 0);
+                    if ret == PAM_SUCCESS {
+                        // Like other lockers, e.g. to renew Kerberos tickets.
+                        pam_setcred(pamh, PAM_REFRESH_CRED);
+                    }
+                    pam_end(pamh, ret);
+                    ret == PAM_SUCCESS
+                }
+            }
+        }
+
+        /// Our own PAM service if the system has one, otherwise "login",
+        /// which every distribution sets up for password logins. (The
+        /// fallback for unknown services, "other", denies everything on
+        /// some.)
+        fn service_name() -> &'static str {
+            let ours = ["/etc/pam.d/lavalock", "/usr/lib/pam.d/lavalock"];
+            if ours.iter().any(|p| Path::new(p).exists()) {
+                "lavalock"
+            } else {
+                "login"
+            }
+        }
+    }
+
+    #[cfg(target_os = "openbsd")]
+    mod bsd_auth {
+        use std::ffi::{CStr, CString, c_char, c_int};
+        use std::ptr;
+
+        use super::{Password, wipe};
+
+        unsafe extern "C" {
+            fn auth_userokay(
+                name: *mut c_char,
+                style: *mut c_char,
+                ty: *mut c_char,
+                password: *mut c_char,
+            ) -> c_int;
+        }
+
+        /// Holds the login scripts that check passwords. Only the "auth"
+        /// group may use them, so like xlock, we must be installed setgid
+        /// auth.
+        const AUTH_DIR: &CStr = c"/usr/libexec/auth";
+
+        #[derive(Clone)]
+        pub struct Backend {
+            user: CString,
+        }
+
+        impl Backend {
+            pub fn new(user: CString) -> Result<Self, String> {
+                let usable = unsafe {
+                    libc::faccessat(
+                        libc::AT_FDCWD,
+                        AUTH_DIR.as_ptr(),
+                        libc::X_OK,
+                        libc::AT_EACCESS,
+                    )
+                } == 0;
+                if usable {
+                    Ok(Self { user })
+                } else {
+                    Err(
+                        "cannot use BSD Authentication; lavalock must be setgid auth \
+                         (chown root:auth lavalock && chmod 2555 lavalock)"
+                            .into(),
+                    )
+                }
+            }
+
+            pub fn authenticate(&self, password: &Password) -> bool {
+                // auth_userokay takes mutable, NUL-terminated strings.
+                let mut user = self.user.clone().into_bytes_with_nul();
+                let mut pw = Vec::with_capacity(password.0.len() + 1);
+                pw.extend_from_slice(&password.0);
+                pw.push(0);
+                // Without a style and type, the user's login class decides
+                // how to authenticate.
+                let ok = unsafe {
+                    auth_userokay(
+                        user.as_mut_ptr().cast(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        pw.as_mut_ptr().cast(),
+                    )
+                } != 0;
+                wipe(&mut pw);
+                ok
+            }
         }
     }
 }
@@ -1096,15 +1191,14 @@ fn run_screens<O: Output>(
         .expect("Event loop error");
 }
 
+fn fail(err: &str) -> ! {
+    eprintln!("lavalock: {err}");
+    std::process::exit(1);
+}
+
 fn main() {
     // Make sure we'll be able to unlock before locking.
-    let auth = match auth::Authenticator::new() {
-        Ok(auth) => auth,
-        Err(err) => {
-            eprintln!("lavalock: {err}");
-            std::process::exit(1);
-        }
-    };
+    let auth = auth::Authenticator::new().unwrap_or_else(|err| fail(&err));
 
     #[cfg(feature = "renderer-gl")]
     {
