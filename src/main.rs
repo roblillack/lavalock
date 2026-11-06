@@ -345,8 +345,8 @@ fn window_builder(monitor: &Option<MonitorHandle>) -> WindowBuilder {
     builder.with_fullscreen(Some(Fullscreen::Borderless(monitor.clone())))
 }
 
-fn enter_fullscreen(window: &Window, monitor: Option<MonitorHandle>) {
-    window.set_fullscreen(Some(Fullscreen::Borderless(monitor)));
+fn enter_fullscreen(window: &Window, monitor: &Option<MonitorHandle>) {
+    window.set_fullscreen(Some(Fullscreen::Borderless(monitor.clone())));
     window.set_cursor_visible(window.fullscreen().is_none());
 }
 
@@ -357,16 +357,24 @@ trait Output {
     fn render(&mut self, scene: &goop::Scene);
 }
 
+/// How often to ask for fullscreen again after the compositor took it away,
+/// so we don't fight one that keeps refusing.
+const MAX_FULLSCREEN_RETRIES: u32 = 3;
+
 struct Screen<O> {
     output: O,
+    monitor: Option<MonitorHandle>,
+    fullscreen_retries: u32,
     scene: goop::Scene,
 }
 
 impl<O: Output> Screen<O> {
-    fn new(output: O) -> Self {
+    fn new((output, monitor): (O, Option<MonitorHandle>)) -> Self {
         let size = output.window().inner_size();
         Self {
             output,
+            monitor,
+            fullscreen_retries: 0,
             scene: goop::Scene::new(size.width as f64, size.height as f64),
         }
     }
@@ -375,12 +383,18 @@ impl<O: Output> Screen<O> {
         self.output.resize(size);
         self.scene = goop::Scene::new(size.width as f64, size.height as f64);
         let window = self.output.window();
+        // Some compositors (e.g. River) drop a window out of fullscreen when
+        // the next window gets mapped, so request it again.
+        if window.fullscreen().is_none() && self.fullscreen_retries < MAX_FULLSCREEN_RETRIES {
+            self.fullscreen_retries += 1;
+            enter_fullscreen(window, &self.monitor);
+        }
         window.set_cursor_visible(window.fullscreen().is_none());
         window.request_redraw();
     }
 }
 
-fn run_screens<O: Output>(event_loop: EventLoop<()>, outputs: Vec<O>) {
+fn run_screens<O: Output>(event_loop: EventLoop<()>, outputs: Vec<(O, Option<MonitorHandle>)>) {
     let mut screens: Vec<Screen<O>> = outputs.into_iter().map(Screen::new).collect();
     let mut next_tick = Instant::now();
 
@@ -504,7 +518,7 @@ mod gl_app {
                     .expect("Failed to create window"),
             );
         }
-        for (window, monitor) in windows.iter().zip(monitors) {
+        for (window, monitor) in windows.iter().zip(&monitors) {
             enter_fullscreen(window, monitor);
         }
 
@@ -542,7 +556,11 @@ mod gl_app {
         let outputs = windows
             .into_iter()
             .zip(surfaces)
-            .map(|(window, surface)| GlOutput::new(window, surface, gl_context.clone(), &gl_config))
+            .zip(monitors)
+            .map(|((window, surface), monitor)| {
+                let output = GlOutput::new(window, surface, gl_context.clone(), &gl_config);
+                (output, monitor)
+            })
             .collect();
 
         run_screens(event_loop, outputs);
@@ -671,15 +689,15 @@ mod cpu_renderer {
     use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
 
     /// One fullscreen window per monitor.
-    pub fn create_windows(event_loop: &EventLoop<()>) -> Vec<Window> {
+    pub fn create_windows(event_loop: &EventLoop<()>) -> Vec<(Window, Option<MonitorHandle>)> {
         monitors(event_loop)
             .into_iter()
             .map(|monitor| {
                 let window = window_builder(&monitor)
                     .build(event_loop)
                     .expect("Failed to create window");
-                enter_fullscreen(&window, monitor);
-                window
+                enter_fullscreen(&window, &monitor);
+                (window, monitor)
             })
             .collect()
     }
@@ -740,7 +758,7 @@ mod softbuffer_app {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
-            .map(SoftbufferOutput::new)
+            .map(|(window, monitor)| (SoftbufferOutput::new(window), monitor))
             .collect();
         run_screens(event_loop, outputs);
     }
@@ -822,7 +840,7 @@ mod pixels_app {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
-            .map(PixelsOutput::new)
+            .map(|(window, monitor)| (PixelsOutput::new(window), monitor))
             .collect();
         run_screens(event_loop, outputs);
     }
