@@ -702,12 +702,26 @@ mod cpu_renderer {
             .collect()
     }
 
-    pub fn draw_scene(pixmap: &mut PixmapMut<'_>, scene: &goop::Scene) {
+    /// Byte order of the pixels `draw_scene` writes. tiny-skia always writes
+    /// RGBA; drawing with red and blue swapped yields BGRA instead.
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // Each renderer uses only one of them.
+    pub enum ChannelOrder {
+        Rgba,
+        Bgra,
+    }
+
+    pub fn draw_scene(pixmap: &mut PixmapMut<'_>, scene: &goop::Scene, order: ChannelOrder) {
         pixmap.fill(Color::BLACK);
 
         for layer in &scene.layers {
+            let [r, g, b] = layer.color;
+            let (r, b) = match order {
+                ChannelOrder::Rgba => (r, b),
+                ChannelOrder::Bgra => (b, r),
+            };
             let mut paint = Paint::default();
-            paint.set_color_rgba8(layer.color[0], layer.color[1], layer.color[2], 255);
+            paint.set_color_rgba8(r, g, b, 255);
             paint.anti_alias = true;
 
             for blob in &layer.blobs {
@@ -750,9 +764,14 @@ mod softbuffer_app {
     use softbuffer::{Context, Surface};
     use std::num::NonZeroU32;
     use std::rc::Rc;
-    use tiny_skia::Pixmap;
+    use tiny_skia::PixmapMut;
 
-    use crate::cpu_renderer::{create_windows, draw_scene};
+    use crate::cpu_renderer::{ChannelOrder, create_windows, draw_scene};
+
+    // We render straight into softbuffer's 0RGB `u32`s, which are BGRA bytes
+    // only on little-endian machines.
+    #[cfg(target_endian = "big")]
+    compile_error!("renderer-softbuffer requires a little-endian target.");
 
     pub fn run() {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
@@ -766,7 +785,7 @@ mod softbuffer_app {
     struct SoftbufferOutput {
         surface: Surface<Rc<Window>, Rc<Window>>,
         _context: Context<Rc<Window>>,
-        pixmap: Pixmap,
+        size: PhysicalSize<u32>,
         window: Rc<Window>,
     }
 
@@ -780,7 +799,7 @@ mod softbuffer_app {
             let mut output = Self {
                 surface,
                 _context: context,
-                pixmap: Pixmap::new(1, 1).unwrap(),
+                size,
                 window,
             };
             output.resize(size);
@@ -794,35 +813,32 @@ mod softbuffer_app {
         }
 
         fn resize(&mut self, size: PhysicalSize<u32>) {
+            self.size = PhysicalSize::new(size.width.max(1), size.height.max(1));
             self.surface
                 .resize(
-                    NonZeroU32::new(size.width.max(1)).unwrap(),
-                    NonZeroU32::new(size.height.max(1)).unwrap(),
+                    NonZeroU32::new(self.size.width).unwrap(),
+                    NonZeroU32::new(self.size.height).unwrap(),
                 )
                 .expect("Failed to resize surface");
-            self.pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
-                .expect("Failed to create pixmap");
         }
 
         fn render(&mut self, scene: &goop::Scene) {
-            draw_scene(&mut self.pixmap.as_mut(), scene);
-
             let mut buffer = self
                 .surface
                 .buffer_mut()
                 .expect("Failed to get softbuffer buffer");
-            blit_pixmap_to_buffer(&self.pixmap, &mut buffer);
+            // Draw directly into the buffer instead of into a separate pixmap
+            // that then has to be converted pixel by pixel. All our pixels
+            // are opaque, so the top byte is always 0xFF rather than the 0
+            // softbuffer asks for; every backend either ignores it or reads
+            // it as full alpha.
+            let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut buffer);
+            if let Some(mut pixmap) =
+                PixmapMut::from_bytes(bytes, self.size.width, self.size.height)
+            {
+                draw_scene(&mut pixmap, scene, ChannelOrder::Bgra);
+            }
             buffer.present().expect("Failed to present buffer");
-        }
-    }
-
-    fn blit_pixmap_to_buffer(pixmap: &Pixmap, buffer: &mut [u32]) {
-        let data = pixmap.data();
-        for (i, chunk) in data.chunks_exact(4).enumerate() {
-            let r = chunk[0] as u32;
-            let g = chunk[1] as u32;
-            let b = chunk[2] as u32;
-            buffer[i] = (r << 16) | (g << 8) | b;
         }
     }
 }
@@ -831,10 +847,10 @@ mod softbuffer_app {
 mod pixels_app {
     use super::*;
 
-    use pixels::{Pixels, SurfaceTexture};
+    use pixels::{PixelsBuilder, SurfaceTexture};
     use tiny_skia::PixmapMut;
 
-    use crate::cpu_renderer::{create_windows, draw_scene};
+    use crate::cpu_renderer::{ChannelOrder, create_windows, draw_scene};
 
     pub fn run() {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
@@ -846,7 +862,7 @@ mod pixels_app {
     }
 
     struct PixelsOutput {
-        pixels: Pixels,
+        pixels: pixels::Pixels,
         size: PhysicalSize<u32>,
         window: Window,
     }
@@ -856,7 +872,11 @@ mod pixels_app {
             let size = window.inner_size();
             let surface_texture =
                 SurfaceTexture::new(size.width.max(1), size.height.max(1), &window);
-            let pixels = Pixels::new(size.width.max(1), size.height.max(1), surface_texture)
+            // As with GL: waiting for vblank in every window's render would
+            // stall the frame loop once per monitor. FRAME_INTERVAL paces.
+            let pixels = PixelsBuilder::new(size.width.max(1), size.height.max(1), surface_texture)
+                .enable_vsync(false)
+                .build()
                 .expect("Failed to create Pixels surface");
             Self {
                 pixels,
@@ -885,7 +905,7 @@ mod pixels_app {
             let (width, height) = (self.size.width.max(1), self.size.height.max(1));
             if let Some(mut pixmap) = PixmapMut::from_bytes(self.pixels.frame_mut(), width, height)
             {
-                draw_scene(&mut pixmap, scene);
+                draw_scene(&mut pixmap, scene, ChannelOrder::Rgba);
             }
             self.pixels.render().expect("Pixels render failed");
         }

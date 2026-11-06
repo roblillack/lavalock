@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = { version = "1", optional = true }
 femtovg = { version = "0.9", optional = true }
 glutin = { version = "0.31", optional = true }
 glutin-winit = { version = "0.4", optional = true }
@@ -16,7 +17,7 @@ winit = { version = "0.29", features = ["rwh_05"] }
 [features]
 default = ["renderer-gl"]
 renderer-gl = ["dep:femtovg", "dep:glutin", "dep:glutin-winit", "dep:raw-window-handle"]
-renderer-softbuffer = ["dep:softbuffer", "dep:tiny-skia"]
+renderer-softbuffer = ["dep:bytemuck", "dep:softbuffer", "dep:tiny-skia"]
 renderer-pixels = ["dep:pixels", "dep:tiny-skia"]
 
 [profile.release]
@@ -25,3 +26,16 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The CPU renderers spend nearly all their time in tiny-skia's rasterizer,
+# which is ~2.5x slower when optimized for size.
+[profile.release.package.tiny-skia]
+opt-level = 3
+
+[profile.release.package.tiny-skia-path]
+opt-level = 3
+
+# Unoptimized tiny-skia and wgpu are unusably slow, so optimize dependencies
+# even in debug builds.
+[profile.dev.package."*"]
+opt-level = 3
