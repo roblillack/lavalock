@@ -1,8 +1,10 @@
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, Event, StartCause, WindowEvent};
+use winit::event::{ElementState, Event, KeyEvent, StartCause, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget};
+use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowBuilder};
 
@@ -81,6 +83,12 @@ mod goop {
         min_r: f64,
         max_r: f64,
         r: Vec<f64>,
+        /// Drawing size relative to the blob's natural size.
+        scale: f64,
+        /// Position within the current formation.
+        slot: usize,
+        /// Offsets the blob's wobble while in formation.
+        phase: f64,
     }
 
     impl Blob {
@@ -110,7 +118,25 @@ mod goop {
                 min_r,
                 max_r,
                 r,
+                scale: 1.0,
+                slot: 0,
+                phase: TAU * rng::unit(),
             }
+        }
+
+        fn nominal_radius(&self) -> f64 {
+            (self.min_r + self.max_r) / 2.0
+        }
+
+        fn extent(&self) -> f64 {
+            self.r.iter().fold(0.0, |m: f64, r| m.max(r.abs())) * self.scale
+        }
+
+        /// Moves a fraction `k` of the way toward the given position and scale.
+        fn follow(&mut self, x: f64, y: f64, scale: f64, k: f64) {
+            self.x += (x - self.x) * k;
+            self.y += (y - self.y) * k;
+            self.scale += (scale - self.scale) * k;
         }
 
         pub fn throb(&mut self) {
@@ -134,6 +160,11 @@ mod goop {
         }
 
         pub fn step(&mut self, maxx: f64, maxy: f64) {
+            self.drift(maxx, maxy);
+            self.spin();
+        }
+
+        fn drift(&mut self, maxx: f64, maxy: f64) {
             self.x += self.dx;
             self.y += self.dy;
 
@@ -154,9 +185,15 @@ mod goop {
                     self.dy /= 2.0;
                 }
             }
+        }
 
+        fn spin(&mut self) {
             let d = self.torque * rng::unit();
-            let mut th = if self.th < 0.0 { -(self.th + d) } else { self.th + d };
+            let mut th = if self.th < 0.0 {
+                -(self.th + d)
+            } else {
+                self.th + d
+            };
             if th > TAU {
                 th -= TAU;
             } else if th < 0.0 {
@@ -175,7 +212,7 @@ mod goop {
             let th = self.th.abs();
             (0..n)
                 .map(|i| {
-                    let ra = self.r[i].abs();
+                    let ra = self.r[i].abs() * self.scale;
                     let a = i as f64 * frac + th;
                     (self.x + ra * a.cos(), self.y + ra * a.sin())
                 })
@@ -188,10 +225,53 @@ mod goop {
         pub color: [u8; 3],
     }
 
+    /// How the blobs are arranged.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Formation {
+        /// Regular goop: the blobs roam the whole screen.
+        Free,
+        /// Small blobs in a circle around the center, while typing.
+        Ring,
+        /// Small blobs in a horizontal line that shakes its head, then goes
+        /// back to `Free` by itself.
+        Line,
+        /// The blobs fly outward while the background fades away.
+        Burst,
+    }
+
+    // Formation geometry, relative to the shorter side of the screen.
+    const BALL_RADIUS: f64 = 0.055;
+    const RING_RADIUS: f64 = 0.22;
+    const WOBBLE: f64 = 0.012;
+    const SHAKE_AMPLITUDE: f64 = 0.08;
+
+    // Formation timing, in frames.
+    const LINE_FORM_FRAMES: u32 = 8;
+    const SHAKE_FRAMES: u32 = 18;
+    const SHAKES: f64 = 3.0;
+    /// Each turn of the ring takes 3 frames, plus one to tell turns apart.
+    const TURN_FRAMES: u32 = 4;
+    const FADE_FRAMES: u32 = 10;
+    const MAX_BURST_FRAMES: u32 = 60;
+
     pub struct Scene {
         pub layers: Vec<Layer>,
         pub width: f64,
         pub height: f64,
+        formation: Formation,
+        /// Frames since entering the current formation.
+        frame: u32,
+        /// Frames since the scene was created.
+        clock: u64,
+        /// Angle of the ring, chasing `rotation_target`.
+        rotation: f64,
+        rotation_target: f64,
+        /// Whether the ring keeps turning on its own.
+        spinning: bool,
+        /// Turns still to be made, one after the other.
+        pending_turns: u32,
+        /// Frames until the next pending turn may start.
+        turn_cooldown: u32,
     }
 
     impl Scene {
@@ -238,14 +318,223 @@ mod goop {
                 layers,
                 width,
                 height,
+                formation: Formation::Free,
+                frame: 0,
+                clock: 0,
+                rotation: 0.0,
+                rotation_target: 0.0,
+                spinning: false,
+                pending_turns: 0,
+                turn_cooldown: 0,
             }
         }
 
+        /// A new scene of the given size in the same formation as this one.
+        pub fn resized(&self, width: f64, height: f64) -> Self {
+            let mut scene = Self::new(width, height);
+            scene.spinning = self.spinning;
+            scene.set_formation(self.formation);
+            scene
+        }
+
+        fn blobs(&self) -> impl Iterator<Item = &Blob> {
+            self.layers.iter().flat_map(|layer| layer.blobs.iter())
+        }
+
+        fn blobs_mut(&mut self) -> impl Iterator<Item = &mut Blob> {
+            self.layers
+                .iter_mut()
+                .flat_map(|layer| layer.blobs.iter_mut())
+        }
+
+        fn center(&self) -> (f64, f64) {
+            (self.width / 2.0, self.height / 2.0)
+        }
+
+        fn unit(&self) -> f64 {
+            self.width.min(self.height)
+        }
+
+        /// Numbers the blobs in the order of `key`.
+        fn assign_slots(&mut self, key: impl Fn(&Blob) -> f64) {
+            let mut blobs: Vec<&mut Blob> = self.blobs_mut().collect();
+            blobs.sort_by(|a, b| key(a).total_cmp(&key(b)));
+            for (slot, blob) in blobs.into_iter().enumerate() {
+                blob.slot = slot;
+            }
+        }
+
+        pub fn formation(&self) -> Formation {
+            self.formation
+        }
+
+        pub fn set_formation(&mut self, formation: Formation) {
+            if formation == self.formation {
+                return;
+            }
+            let (cx, cy) = self.center();
+            match formation {
+                Formation::Free => {}
+                Formation::Ring => {
+                    // Keep the order the blobs already have around the
+                    // center, and turn the ring so they travel the least.
+                    let angle = |b: &Blob| (b.y - cy).atan2(b.x - cx);
+                    self.assign_slots(angle);
+                    let step = TAU / self.blobs().count().max(1) as f64;
+                    let (sx, sy) = self.blobs().fold((0.0, 0.0), |(sx, sy), b| {
+                        let a = angle(b) - b.slot as f64 * step;
+                        (sx + a.cos(), sy + a.sin())
+                    });
+                    self.rotation = sy.atan2(sx);
+                    self.rotation_target = self.rotation;
+                }
+                Formation::Line => self.assign_slots(|b| b.x),
+                Formation::Burst => {
+                    let speed = 0.02 * self.unit();
+                    for blob in self.blobs_mut() {
+                        let (dx, dy) = (blob.x - cx, blob.y - cy);
+                        let d = dx.hypot(dy);
+                        let a = if d > 1e-6 {
+                            dy.atan2(dx)
+                        } else {
+                            TAU * rng::unit()
+                        };
+                        blob.dx = a.cos() * speed;
+                        blob.dy = a.sin() * speed;
+                    }
+                }
+            }
+            self.formation = formation;
+            self.frame = 0;
+            self.pending_turns = 0;
+        }
+
+        /// Turns the ring a bit further, `turns` times in a row.
+        pub fn nudge(&mut self, turns: u32) {
+            self.pending_turns += turns;
+        }
+
+        pub fn set_spinning(&mut self, spinning: bool) {
+            self.spinning = spinning;
+        }
+
+        /// Opacity of the black background.
+        #[cfg_attr(not(feature = "renderer-gl"), allow(dead_code))]
+        pub fn background_alpha(&self) -> f64 {
+            match self.formation {
+                Formation::Burst => (1.0 - self.frame as f64 / FADE_FRAMES as f64).max(0.0),
+                _ => 1.0,
+            }
+        }
+
+        /// Whether the burst is over: the background is gone and so are the
+        /// blobs.
+        pub fn finished(&self) -> bool {
+            if self.formation != Formation::Burst {
+                return false;
+            }
+            let gone = |b: &Blob| {
+                let e = b.extent();
+                b.x + e < 0.0 || b.x - e > self.width || b.y + e < 0.0 || b.y - e > self.height
+            };
+            self.frame >= MAX_BURST_FRAMES || (self.frame >= FADE_FRAMES && self.blobs().all(gone))
+        }
+
         pub fn advance(&mut self) {
-            for layer in &mut self.layers {
-                for blob in &mut layer.blobs {
-                    blob.throb();
-                    blob.step(self.width, self.height);
+            self.frame = self.frame.saturating_add(1);
+            self.clock += 1;
+            if self.formation == Formation::Line && self.frame > LINE_FORM_FRAMES + SHAKE_FRAMES {
+                self.set_formation(Formation::Free);
+            }
+
+            let (width, height) = (self.width, self.height);
+            let (cx, cy) = self.center();
+            let unit = self.unit();
+            let n = self.blobs().count().max(1) as f64;
+            let ball = BALL_RADIUS * unit;
+            let clock = self.clock as f64;
+            let wobble = |b: &Blob| {
+                (
+                    WOBBLE * unit * (clock * 0.05 + b.phase).sin(),
+                    WOBBLE * unit * (clock * 0.037 + 1.7 * b.phase).cos(),
+                )
+            };
+
+            match self.formation {
+                Formation::Free => {
+                    for blob in self.blobs_mut() {
+                        blob.throb();
+                        blob.step(width, height);
+                        let (x, y) = (blob.x, blob.y);
+                        blob.follow(x, y, 1.0, 0.1);
+                    }
+                }
+                Formation::Ring => {
+                    if self.spinning {
+                        self.rotation_target += 0.1;
+                    }
+                    self.turn_cooldown = self.turn_cooldown.saturating_sub(1);
+                    if self.pending_turns > 0 && self.turn_cooldown == 0 {
+                        self.pending_turns -= 1;
+                        self.turn_cooldown = TURN_FRAMES;
+                        self.rotation_target += 0.12 + 0.18 * rng::unit();
+                    }
+                    // Settles within ~3 frames (0.1 s).
+                    let turn = (self.rotation_target - self.rotation) * 0.78;
+                    self.rotation += turn;
+                    let rotation = self.rotation;
+                    let radius = RING_RADIUS * unit;
+                    let (sin, cos) = turn.sin_cos();
+                    for blob in self.blobs_mut() {
+                        // Turn the blobs along with the ring right away, so
+                        // following their slots below doesn't slow it down.
+                        let (dx, dy) = (blob.x - cx, blob.y - cy);
+                        blob.x = cx + dx * cos - dy * sin;
+                        blob.y = cy + dx * sin + dy * cos;
+
+                        let a = rotation + blob.slot as f64 * TAU / n;
+                        let (wx, wy) = wobble(blob);
+                        let scale = ball / blob.nominal_radius();
+                        blob.throb();
+                        blob.spin();
+                        // Gathers within ~9 frames (0.3 s).
+                        blob.follow(
+                            cx + radius * a.cos() + wx,
+                            cy + radius * a.sin() + wy,
+                            scale,
+                            0.4,
+                        );
+                    }
+                }
+                Formation::Line => {
+                    let shaking = self.frame.saturating_sub(LINE_FORM_FRAMES);
+                    let (offset, k) = if shaking > 0 {
+                        let p = shaking as f64 / SHAKE_FRAMES as f64;
+                        let amplitude = SHAKE_AMPLITUDE * unit * (1.0 - 0.5 * p);
+                        (amplitude * (TAU * SHAKES * p).sin(), 0.7)
+                    } else {
+                        (0.0, 0.35)
+                    };
+                    let spacing = (2.2 * ball).min(0.9 * width / n);
+                    for blob in self.blobs_mut() {
+                        let (wx, wy) = wobble(blob);
+                        let x = cx + (blob.slot as f64 - (n - 1.0) / 2.0) * spacing + offset;
+                        let scale = ball / blob.nominal_radius();
+                        blob.throb();
+                        blob.spin();
+                        blob.follow(x + wx / 2.0, cy + wy / 2.0, scale, k);
+                    }
+                }
+                Formation::Burst => {
+                    for blob in self.blobs_mut() {
+                        blob.x += blob.dx;
+                        blob.y += blob.dy;
+                        blob.dx *= 1.25;
+                        blob.dy *= 1.25;
+                        blob.scale *= 1.05;
+                        blob.throb();
+                        blob.spin();
+                    }
                 }
             }
         }
@@ -320,8 +609,263 @@ mod goop {
     }
 }
 
-fn is_key_press(event: &winit::event::KeyEvent) -> bool {
-    event.state == ElementState::Pressed
+#[cfg(not(target_os = "linux"))]
+compile_error!("Unlocking is only implemented with Linux-PAM.");
+
+mod auth {
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::path::Path;
+    use std::sync::atomic::{Ordering, compiler_fence};
+    use std::sync::mpsc::{self, Receiver};
+    use std::{ptr, thread};
+
+    /// Longest password we accept, in bytes. Allocating it all up front means
+    /// the buffer never moves, so there are no stray copies to wipe.
+    const MAX_PASSWORD_LEN: usize = 255;
+
+    /// A password that is wiped from memory when cleared or dropped.
+    pub struct Password(Vec<u8>);
+
+    impl Password {
+        pub fn new() -> Self {
+            Self(Vec::with_capacity(MAX_PASSWORD_LEN))
+        }
+
+        /// Appends a character, unless the password is already full.
+        pub fn push(&mut self, ch: char) -> bool {
+            let mut buf = [0u8; 4];
+            let bytes = ch.encode_utf8(&mut buf).as_bytes();
+            let fits = self.0.len() + bytes.len() <= MAX_PASSWORD_LEN;
+            if fits {
+                self.0.extend_from_slice(bytes);
+            }
+            wipe(&mut buf);
+            fits
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        pub fn clear(&mut self) {
+            wipe(&mut self.0);
+            self.0.clear();
+        }
+
+        /// Moves the password out, leaving this one empty.
+        pub fn take(&mut self) -> Self {
+            std::mem::replace(self, Self::new())
+        }
+    }
+
+    impl Drop for Password {
+        fn drop(&mut self) {
+            self.clear();
+        }
+    }
+
+    fn wipe(bytes: &mut [u8]) {
+        for b in bytes {
+            unsafe { ptr::write_volatile(b, 0) };
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    #[repr(C)]
+    struct PamHandle {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    struct PamMessage {
+        msg_style: c_int,
+        msg: *const c_char,
+    }
+
+    #[repr(C)]
+    struct PamResponse {
+        resp: *mut c_char,
+        resp_retcode: c_int,
+    }
+
+    type ConvFn = unsafe extern "C" fn(
+        c_int,
+        *mut *const PamMessage,
+        *mut *mut PamResponse,
+        *mut c_void,
+    ) -> c_int;
+
+    #[repr(C)]
+    struct PamConv {
+        conv: Option<ConvFn>,
+        appdata_ptr: *mut c_void,
+    }
+
+    const PAM_SUCCESS: c_int = 0;
+    const PAM_BUF_ERR: c_int = 5;
+    const PAM_CONV_ERR: c_int = 19;
+    const PAM_REFRESH_CRED: c_int = 0x0010;
+    const PAM_PROMPT_ECHO_OFF: c_int = 1;
+    const PAM_PROMPT_ECHO_ON: c_int = 2;
+    const PAM_MAX_NUM_MSG: c_int = 32;
+
+    // Link the runtime library directly: the unversioned libpam.so only
+    // comes with the development package.
+    #[link(name = "libpam.so.0", kind = "dylib", modifiers = "+verbatim")]
+    unsafe extern "C" {
+        fn pam_start(
+            service_name: *const c_char,
+            user: *const c_char,
+            pam_conversation: *const PamConv,
+            pamh: *mut *mut PamHandle,
+        ) -> c_int;
+        fn pam_authenticate(pamh: *mut PamHandle, flags: c_int) -> c_int;
+        fn pam_setcred(pamh: *mut PamHandle, flags: c_int) -> c_int;
+        fn pam_end(pamh: *mut PamHandle, pam_status: c_int) -> c_int;
+    }
+
+    /// Answers PAM's prompts with the password `appdata` points to.
+    unsafe extern "C" fn converse(
+        num_msg: c_int,
+        msg: *mut *const PamMessage,
+        resp: *mut *mut PamResponse,
+        appdata: *mut c_void,
+    ) -> c_int {
+        if num_msg <= 0 || num_msg > PAM_MAX_NUM_MSG || appdata.is_null() {
+            return PAM_CONV_ERR;
+        }
+        let num_msg = num_msg as usize;
+        let password = unsafe { &*(appdata as *const Password) };
+
+        // PAM frees the replies with free(), so they must come from malloc.
+        let replies =
+            unsafe { libc::calloc(num_msg, size_of::<PamResponse>()) } as *mut PamResponse;
+        if replies.is_null() {
+            return PAM_BUF_ERR;
+        }
+        for i in 0..num_msg {
+            let style = unsafe { (**msg.add(i)).msg_style };
+            if style != PAM_PROMPT_ECHO_OFF && style != PAM_PROMPT_ECHO_ON {
+                continue;
+            }
+            let len = password.0.len();
+            let copy = unsafe { libc::malloc(len + 1) } as *mut u8;
+            if copy.is_null() {
+                unsafe { free_replies(replies, i) };
+                return PAM_BUF_ERR;
+            }
+            unsafe {
+                ptr::copy_nonoverlapping(password.0.as_ptr(), copy, len);
+                *copy.add(len) = 0;
+                (*replies.add(i)).resp = copy as *mut c_char;
+            }
+        }
+        unsafe { *resp = replies };
+        PAM_SUCCESS
+    }
+
+    /// Wipes and frees the first `n` replies and the array holding them.
+    unsafe fn free_replies(replies: *mut PamResponse, n: usize) {
+        for i in 0..n {
+            let reply = unsafe { (*replies.add(i)).resp };
+            if !reply.is_null() {
+                unsafe {
+                    let len = libc::strlen(reply);
+                    wipe(std::slice::from_raw_parts_mut(reply as *mut u8, len));
+                    libc::free(reply as *mut c_void);
+                }
+            }
+        }
+        unsafe { libc::free(replies as *mut c_void) };
+    }
+
+    /// Checks passwords for the user running us.
+    pub struct Authenticator {
+        service: CString,
+        user: CString,
+    }
+
+    impl Authenticator {
+        pub fn new() -> Result<Self, String> {
+            let pw = unsafe { libc::getpwuid(libc::getuid()) };
+            if pw.is_null() {
+                return Err("cannot look up the current user".into());
+            }
+            let user = unsafe { CStr::from_ptr((*pw).pw_name) }.to_owned();
+            let auth = Self {
+                service: CString::new(service_name()).unwrap(),
+                user,
+            };
+            // Fail now rather than after locking the screen.
+            let password = Password::new();
+            match auth.start(&password) {
+                Ok(pamh) => {
+                    unsafe { pam_end(pamh, PAM_SUCCESS) };
+                    Ok(auth)
+                }
+                Err(err) => Err(format!("cannot initialize PAM (error {err})")),
+            }
+        }
+
+        fn start(&self, password: &Password) -> Result<*mut PamHandle, c_int> {
+            let conv = PamConv {
+                conv: Some(converse),
+                appdata_ptr: password as *const Password as *mut c_void,
+            };
+            let mut pamh = ptr::null_mut();
+            // PAM copies the conversation struct, but not the password.
+            let ret =
+                unsafe { pam_start(self.service.as_ptr(), self.user.as_ptr(), &conv, &mut pamh) };
+            if ret == PAM_SUCCESS {
+                Ok(pamh)
+            } else {
+                Err(ret)
+            }
+        }
+
+        fn authenticate(&self, password: &Password) -> bool {
+            let Ok(pamh) = self.start(password) else {
+                return false;
+            };
+            unsafe {
+                let ret = pam_authenticate(pamh, 0);
+                if ret == PAM_SUCCESS {
+                    // Like other lockers, e.g. to renew Kerberos tickets.
+                    pam_setcred(pamh, PAM_REFRESH_CRED);
+                }
+                pam_end(pamh, ret);
+                ret == PAM_SUCCESS
+            }
+        }
+
+        /// Checks the password in the background, as PAM may take a while
+        /// (it usually delays failures on purpose).
+        pub fn check(&self, password: Password) -> Receiver<bool> {
+            let (tx, rx) = mpsc::channel();
+            let auth = Self {
+                service: self.service.clone(),
+                user: self.user.clone(),
+            };
+            thread::spawn(move || {
+                let ok = auth.authenticate(&password);
+                drop(password);
+                let _ = tx.send(ok);
+            });
+            rx
+        }
+    }
+
+    /// Our own PAM service if the system has one, otherwise "login", which
+    /// every distribution sets up for password logins. (The fallback for
+    /// unknown services, "other", denies everything on some.)
+    fn service_name() -> &'static str {
+        let ours = ["/etc/pam.d/lavalock", "/usr/lib/pam.d/lavalock"];
+        if ours.iter().any(|p| Path::new(p).exists()) {
+            "lavalock"
+        } else {
+            "login"
+        }
+    }
 }
 
 /// The monitors to cover, one window each. Falls back to a single window on
@@ -381,7 +925,7 @@ impl<O: Output> Screen<O> {
 
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.output.resize(size);
-        self.scene = goop::Scene::new(size.width as f64, size.height as f64);
+        self.scene = self.scene.resized(size.width as f64, size.height as f64);
         let window = self.output.window();
         // Some compositors (e.g. River) drop a window out of fullscreen when
         // the next window gets mapped, so request it again.
@@ -394,8 +938,107 @@ impl<O: Output> Screen<O> {
     }
 }
 
-fn run_screens<O: Output>(event_loop: EventLoop<()>, outputs: Vec<(O, Option<MonitorHandle>)>) {
+/// Password entry, and what the screens show for it.
+struct Lock {
+    auth: auth::Authenticator,
+    password: auth::Password,
+    /// The pending result while a password is being checked.
+    checking: Option<Receiver<bool>>,
+    unlocking: bool,
+}
+
+impl Lock {
+    fn new(auth: auth::Authenticator) -> Self {
+        Self {
+            auth,
+            password: auth::Password::new(),
+            checking: None,
+            unlocking: false,
+        }
+    }
+
+    fn key<O>(&mut self, event: &KeyEvent, screens: &mut [Screen<O>]) {
+        if event.state != ElementState::Pressed || self.checking.is_some() || self.unlocking {
+            return;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => {
+                if !self.password.is_empty() {
+                    self.checking = Some(self.auth.check(self.password.take()));
+                    each_scene(screens, |scene| scene.set_spinning(true));
+                }
+            }
+            Key::Named(NamedKey::Escape | NamedKey::Backspace) => {
+                self.password.clear();
+                each_scene(screens, |scene| scene.set_formation(goop::Formation::Free));
+            }
+            _ => {
+                let Some(text) = &event.text else {
+                    return;
+                };
+                let mut typed = false;
+                for ch in text.chars().filter(|c| !c.is_control()) {
+                    typed |= self.password.push(ch);
+                }
+                if typed {
+                    // A random number of turns per key, so that onlookers
+                    // can't count the keys: 0-3 while gathering into the
+                    // ring, 1-4 afterwards. The same on every screen, or
+                    // comparing screens would give the count away.
+                    let gathering_turns = rng::range(4) as u32;
+                    let turns = 1 + rng::range(4) as u32;
+                    each_scene(screens, |scene| {
+                        if scene.formation() == goop::Formation::Ring {
+                            scene.nudge(turns);
+                        } else {
+                            scene.set_formation(goop::Formation::Ring);
+                            scene.nudge(gathering_turns);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Picks up the result of a password check, if there is one by now.
+    fn poll<O>(&mut self, screens: &mut [Screen<O>]) {
+        let Some(result) = &self.checking else {
+            return;
+        };
+        let formation = match result.try_recv() {
+            Err(TryRecvError::Empty) => return,
+            Ok(true) => {
+                self.unlocking = true;
+                goop::Formation::Burst
+            }
+            Ok(false) | Err(TryRecvError::Disconnected) => goop::Formation::Line,
+        };
+        self.checking = None;
+        each_scene(screens, |scene| {
+            scene.set_spinning(false);
+            scene.set_formation(formation);
+        });
+    }
+
+    /// Whether the screens are unlocked and done animating.
+    fn unlocked<O>(&self, screens: &[Screen<O>]) -> bool {
+        self.unlocking && screens.iter().all(|screen| screen.scene.finished())
+    }
+}
+
+fn each_scene<O>(screens: &mut [Screen<O>], f: impl Fn(&mut goop::Scene)) {
+    for screen in screens {
+        f(&mut screen.scene);
+    }
+}
+
+fn run_screens<O: Output>(
+    event_loop: EventLoop<()>,
+    outputs: Vec<(O, Option<MonitorHandle>)>,
+    auth: auth::Authenticator,
+) {
     let mut screens: Vec<Screen<O>> = outputs.into_iter().map(Screen::new).collect();
+    let mut lock = Lock::new(auth);
     let mut next_tick = Instant::now();
 
     event_loop
@@ -404,33 +1047,31 @@ fn run_screens<O: Output>(event_loop: EventLoop<()>, outputs: Vec<(O, Option<Mon
 
             match event {
                 Event::WindowEvent { window_id, event } => {
-                    let Some(screen) = screens
-                        .iter_mut()
-                        .find(|s| s.output.window().id() == window_id)
+                    let Some(i) = screens
+                        .iter()
+                        .position(|s| s.output.window().id() == window_id)
                     else {
                         return;
                     };
                     match event {
-                        WindowEvent::CloseRequested => elwt.exit(),
-                        WindowEvent::Resized(size) => screen.resize(size),
+                        WindowEvent::Resized(size) => screens[i].resize(size),
                         WindowEvent::ScaleFactorChanged {
                             mut inner_size_writer,
                             ..
                         } => {
-                            let size = screen.output.window().inner_size();
+                            let size = screens[i].output.window().inner_size();
                             let _ = inner_size_writer.request_inner_size(size);
-                            screen.resize(size);
+                            screens[i].resize(size);
                         }
-                        WindowEvent::KeyboardInput { event, .. } => {
-                            if is_key_press(&event) {
-                                elwt.exit();
-                            }
-                        }
-                        WindowEvent::MouseInput {
-                            state: ElementState::Pressed,
+                        // Synthetic presses are for keys that were already
+                        // held down when we got focus.
+                        WindowEvent::KeyboardInput {
+                            event,
+                            is_synthetic: false,
                             ..
-                        } => elwt.exit(),
+                        } => lock.key(&event, &mut screens),
                         WindowEvent::RedrawRequested => {
+                            let screen = &mut screens[i];
                             screen.scene.advance();
                             screen.output.render(&screen.scene);
                             next_tick = Instant::now() + FRAME_INTERVAL;
@@ -440,6 +1081,11 @@ fn run_screens<O: Output>(event_loop: EventLoop<()>, outputs: Vec<(O, Option<Mon
                 }
                 Event::NewEvents(StartCause::ResumeTimeReached { .. })
                 | Event::NewEvents(StartCause::Init) => {
+                    if lock.unlocked(&screens) {
+                        elwt.exit();
+                        return;
+                    }
+                    lock.poll(&mut screens);
                     for screen in &screens {
                         screen.output.window().request_redraw();
                     }
@@ -451,19 +1097,28 @@ fn run_screens<O: Output>(event_loop: EventLoop<()>, outputs: Vec<(O, Option<Mon
 }
 
 fn main() {
+    // Make sure we'll be able to unlock before locking.
+    let auth = match auth::Authenticator::new() {
+        Ok(auth) => auth,
+        Err(err) => {
+            eprintln!("lavalock: {err}");
+            std::process::exit(1);
+        }
+    };
+
     #[cfg(feature = "renderer-gl")]
     {
-        gl_app::run();
+        gl_app::run(auth);
     }
 
     #[cfg(feature = "renderer-softbuffer")]
     {
-        softbuffer_app::run();
+        softbuffer_app::run(auth);
     }
 
     #[cfg(feature = "renderer-pixels")]
     {
-        pixels_app::run();
+        pixels_app::run(auth);
     }
 }
 
@@ -483,23 +1138,32 @@ mod gl_app {
     use glutin_winit::DisplayBuilder;
     use raw_window_handle::HasRawWindowHandle;
 
-    pub fn run() {
+    pub fn run(auth: auth::Authenticator) {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let monitors = monitors(&event_loop);
 
+        // Transparent, so that the desktop shows once we fade out after
+        // unlocking.
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_depth_size(24)
-            .with_stencil_size(8);
+            .with_stencil_size(8)
+            .with_transparency(true);
+        let window_builder = |monitor| window_builder(monitor).with_transparent(true);
 
         let display_builder =
             DisplayBuilder::new().with_window_builder(Some(window_builder(&monitors[0])));
 
         let (window, gl_config) = display_builder
             .build(&event_loop, template, |configs| {
+                let transparent = |c: &Config| c.supports_transparency().unwrap_or(false);
                 configs
                     .reduce(|accum, config| {
-                        if config.num_samples() > accum.num_samples() {
+                        let more_transparent = transparent(&config) && !transparent(&accum);
+                        let as_transparent = transparent(&config) == transparent(&accum);
+                        if more_transparent
+                            || (as_transparent && config.num_samples() > accum.num_samples())
+                        {
                             config
                         } else {
                             accum
@@ -563,7 +1227,7 @@ mod gl_app {
             })
             .collect();
 
-        run_screens(event_loop, outputs);
+        run_screens(event_loop, outputs, auth);
     }
 
     fn create_surface(gl_config: &Config, window: &Window) -> Surface<WindowSurface> {
@@ -653,7 +1317,8 @@ mod gl_app {
     }
 
     fn draw_scene(canvas: &mut Canvas<OpenGl>, scene: &goop::Scene, size: PhysicalSize<u32>) {
-        canvas.clear_rect(0, 0, size.width, size.height, Color::rgb(0, 0, 0));
+        let alpha = (scene.background_alpha() * 255.0).round() as u8;
+        canvas.clear_rect(0, 0, size.width, size.height, Color::rgba(0, 0, 0, alpha));
 
         for layer in &scene.layers {
             let paint = Paint::color(Color::rgb(layer.color[0], layer.color[1], layer.color[2]));
@@ -712,6 +1377,8 @@ mod cpu_renderer {
     }
 
     pub fn draw_scene(pixmap: &mut PixmapMut<'_>, scene: &goop::Scene, order: ChannelOrder) {
+        // Neither softbuffer nor pixels can make the window transparent, so
+        // the background stays black while unlocking.
         pixmap.fill(Color::BLACK);
 
         for layer in &scene.layers {
@@ -775,13 +1442,13 @@ mod softbuffer_app {
     #[cfg(target_endian = "big")]
     compile_error!("renderer-softbuffer requires a little-endian target.");
 
-    pub fn run() {
+    pub fn run(auth: auth::Authenticator) {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
             .map(|(window, monitor)| (SoftbufferOutput::new(window), monitor))
             .collect();
-        run_screens(event_loop, outputs);
+        run_screens(event_loop, outputs, auth);
     }
 
     struct SoftbufferOutput {
@@ -854,13 +1521,13 @@ mod pixels_app {
 
     use crate::cpu_renderer::{ChannelOrder, create_windows, draw_scene};
 
-    pub fn run() {
+    pub fn run(auth: auth::Authenticator) {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
             .map(|(window, monitor)| (PixelsOutput::new(window), monitor))
             .collect();
-        run_screens(event_loop, outputs);
+        run_screens(event_loop, outputs, auth);
     }
 
     struct PixelsOutput {

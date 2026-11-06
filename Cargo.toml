@@ -7,6 +7,7 @@ edition = "2024"
 bytemuck = { version = "1", optional = true }
 femtovg = { version = "0.9", optional = true }
 glutin = { version = "0.31", optional = true }
+libc = "0.2"
 glutin-winit = { version = "0.4", optional = true }
 pixels = { version = "0.13", optional = true }
 raw-window-handle = { version = "0.5", optional = true }
