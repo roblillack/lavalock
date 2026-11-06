@@ -722,7 +722,9 @@ mod cpu_renderer {
             };
             let mut paint = Paint::default();
             paint.set_color_rgba8(r, g, b, 255);
-            paint.anti_alias = true;
+            // Like the original goop, which uses plain XFillPolygon; also
+            // makes drawing about 1.5x faster.
+            paint.anti_alias = false;
 
             for blob in &layer.blobs {
                 let pts = blob.control_points();
