@@ -3,8 +3,8 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, Event, KeyEvent, StartCause, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget};
+use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, StartCause, WindowEvent};
+use winit::event_loop::{ControlFlow, DeviceEvents, EventLoop, EventLoopWindowTarget};
 use winit::keyboard::{Key, NamedKey};
 use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowBuilder};
@@ -974,9 +974,6 @@ mod grab {
     use std::ffi::c_uint;
     use std::time::{Duration, Instant};
 
-    use winit::raw_window_handle::{
-        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
-    };
     use winit::window::Window;
     use x11_dl::xlib;
 
@@ -999,16 +996,10 @@ mod grab {
     impl Grab {
         /// Prepares grabbing input for the window, if it is on X11.
         pub fn new(window: &Window) -> Result<Option<Self>, String> {
-            let (Ok(display), Ok(handle)) = (window.display_handle(), window.window_handle())
-            else {
+            let Some((display, window)) = super::xlib_window(window) else {
                 return Ok(None);
             };
-            let (RawDisplayHandle::Xlib(display), RawWindowHandle::Xlib(handle)) =
-                (display.as_raw(), handle.as_raw())
-            else {
-                return Ok(None);
-            };
-            let display = display.display.ok_or("no X11 display to grab input on")?;
+            let display = display.ok_or("no X11 display to grab input on")?;
             let xlib = xlib::Xlib::open().map_err(|err| format!("cannot load Xlib: {err}"))?;
             let now = Instant::now();
             Ok(Some(Self {
@@ -1016,7 +1007,7 @@ mod grab {
                 // Winit's own connection: grabs belong to a connection, and
                 // winit has to receive the grabbed input.
                 display: display.as_ptr().cast(),
-                window: handle.window,
+                window,
                 deadline: now + STARTUP_TIMEOUT,
                 grabbed: false,
                 next_try: now,
@@ -1067,6 +1058,88 @@ mod grab {
                 });
             }
             Ok(())
+        }
+    }
+}
+
+/// Winit's Xlib display, and the window's id, if the window is on X11.
+fn xlib_window(window: &Window) -> Option<(Option<std::ptr::NonNull<std::ffi::c_void>>, u64)> {
+    use winit::raw_window_handle::{
+        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    };
+
+    let (Ok(display), Ok(handle)) = (window.display_handle(), window.window_handle()) else {
+        return None;
+    };
+    match (display.as_raw(), handle.as_raw()) {
+        (RawDisplayHandle::Xlib(display), RawWindowHandle::Xlib(handle)) => {
+            Some((display.display, handle.window))
+        }
+        _ => None,
+    }
+}
+
+/// Turns the displays off and on through the DPMS extension on X11. The X
+/// server turns them back on by itself on input, too.
+mod dpms {
+    use winit::window::Window;
+    use x11_dl::dpms::{self, Xext};
+    use x11_dl::xlib::{self, Xlib};
+
+    pub struct Dpms {
+        xlib: Xlib,
+        xext: Xext,
+        display: *mut xlib::Display,
+        /// Whether DPMS was disabled until we turned the displays off, so
+        /// that we disable it again when turning them back on.
+        enabled_by_us: bool,
+    }
+
+    impl Dpms {
+        /// Fails if the window isn't on X11 or the server can't do DPMS.
+        pub fn new(window: &Window) -> Result<Self, &'static str> {
+            let display = match super::xlib_window(window) {
+                Some((Some(display), _)) => display.as_ptr().cast(),
+                _ => return Err("only on X11"),
+            };
+            let xlib = Xlib::open().map_err(|_| "cannot load Xlib")?;
+            let xext = Xext::open().map_err(|_| "cannot load libXext")?;
+            let (mut event_base, mut error_base) = (0, 0);
+            let capable = unsafe {
+                (xext.DPMSQueryExtension)(display, &mut event_base, &mut error_base) != 0
+                    && (xext.DPMSCapable)(display) != 0
+            };
+            if !capable {
+                return Err("the X server can't do DPMS");
+            }
+            Ok(Self {
+                xlib,
+                xext,
+                display,
+                enabled_by_us: false,
+            })
+        }
+
+        pub fn set(&mut self, on: bool) {
+            let x = &self.xext;
+            unsafe {
+                if on {
+                    (x.DPMSForceLevel)(self.display, dpms::DPMSModeOn);
+                    if std::mem::take(&mut self.enabled_by_us) {
+                        (x.DPMSDisable)(self.display);
+                    }
+                } else {
+                    // Forcing a level fails while DPMS is disabled.
+                    let (mut level, mut enabled) = (0, 0);
+                    (x.DPMSInfo)(self.display, &mut level, &mut enabled);
+                    if enabled == 0 {
+                        (x.DPMSEnable)(self.display);
+                        self.enabled_by_us = true;
+                    }
+                    (x.DPMSForceLevel)(self.display, dpms::DPMSModeOff);
+                }
+                (self.xlib.XFlush)(self.display);
+            }
         }
     }
 }
@@ -1165,6 +1238,43 @@ impl Input<'_> {
     }
 }
 
+/// Tells when to turn the displays off: after a while without input.
+struct Idle {
+    timeout: Duration,
+    last_input: Instant,
+    off: bool,
+}
+
+impl Idle {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            last_input: Instant::now(),
+            off: false,
+        }
+    }
+
+    /// Notes input. Returns whether to turn the displays back on.
+    fn input(&mut self) -> bool {
+        self.last_input = Instant::now();
+        std::mem::take(&mut self.off)
+    }
+
+    /// Returns whether to turn the displays off now.
+    fn expired(&mut self) -> bool {
+        if self.off || self.last_input.elapsed() < self.timeout {
+            return false;
+        }
+        self.off = true;
+        true
+    }
+
+    /// Whether the displays are off, so there's no point in drawing.
+    fn off(&self) -> bool {
+        self.off
+    }
+}
+
 /// Password entry, and what the screens show for it.
 struct Lock {
     auth: auth::Authenticator,
@@ -1258,10 +1368,22 @@ fn run_screens<O: Output>(
     event_loop: EventLoop<()>,
     outputs: Vec<(O, Rc<Window>, Option<MonitorHandle>)>,
     auth: auth::Authenticator,
+    options: Options,
 ) {
     let mut screens: Vec<Screen<O>> = outputs.into_iter().map(Screen::new).collect();
     let mut lock = Lock::new(auth);
     let mut grab = grab::Grab::new(&screens[0].window).unwrap_or_else(|err| fail(&err));
+    let mut idle = options.display_off.and_then(|timeout| {
+        let dpms = dpms::Dpms::new(&screens[0].window)
+            .inspect_err(|err| eprintln!("lavalock: cannot turn the displays off: {err}"))
+            .ok()?;
+        Some((Idle::new(timeout), dpms))
+    });
+    if idle.is_some() {
+        // Raw input, as the window events include made-up cursor motion,
+        // e.g. when the pointer enters a window.
+        event_loop.listen_device_events(DeviceEvents::Always);
+    }
     let mut next_tick = Instant::now();
 
     event_loop
@@ -1290,6 +1412,11 @@ fn run_screens<O: Output>(
                             is_synthetic: false,
                             ..
                         } => {
+                            if let Some((idle, dpms)) = &mut idle
+                                && idle.input()
+                            {
+                                dpms.set(true);
+                            }
                             if let Some(input) = Input::from_winit(&event) {
                                 lock.input(input, screens.iter_mut().map(|s| &mut s.scene));
                             }
@@ -1303,9 +1430,28 @@ fn run_screens<O: Output>(
                         _ => {}
                     }
                 }
+                Event::DeviceEvent {
+                    event:
+                        DeviceEvent::MouseMotion { .. }
+                        | DeviceEvent::MouseWheel { .. }
+                        | DeviceEvent::Button { .. }
+                        | DeviceEvent::Key(_),
+                    ..
+                } => {
+                    if let Some((idle, dpms)) = &mut idle
+                        && idle.input()
+                    {
+                        dpms.set(true);
+                    }
+                }
                 Event::NewEvents(StartCause::ResumeTimeReached { .. })
                 | Event::NewEvents(StartCause::Init) => {
                     if lock.unlocked(screens.iter().map(|s| &s.scene)) {
+                        if let Some((idle, dpms)) = &mut idle
+                            && idle.off()
+                        {
+                            dpms.set(true);
+                        }
                         elwt.exit();
                         return;
                     }
@@ -1314,6 +1460,20 @@ fn run_screens<O: Output>(
                         grab.update().unwrap_or_else(|err| fail(err));
                     }
                     lock.poll(screens.iter_mut().map(|s| &mut s.scene));
+                    if let Some((idle, dpms)) = &mut idle {
+                        if idle.expired() {
+                            dpms.set(false);
+                        }
+                        if idle.off() {
+                            // Keep the scenes going, e.g. to finish
+                            // unlocking, but don't draw them.
+                            for screen in &mut screens {
+                                screen.scene.advance();
+                            }
+                            next_tick = Instant::now() + FRAME_INTERVAL;
+                            return;
+                        }
+                    }
                     for screen in &screens {
                         screen.window.request_redraw();
                     }
@@ -1329,6 +1489,47 @@ fn fail(err: &str) -> ! {
     std::process::exit(1);
 }
 
+const USAGE: &str = "\
+usage: lavalock [-d seconds]
+
+  -d, --display-off seconds  turn the displays off after this long without
+                             input (0, the default, never does)";
+
+/// What the command line asks for.
+#[derive(Clone, Copy)]
+struct Options {
+    /// How long to wait for input before turning the displays off.
+    display_off: Option<Duration>,
+}
+
+impl Options {
+    fn parse() -> Self {
+        let usage = || -> ! {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        };
+        let mut options = Self { display_off: None };
+        let mut args = std::env::args_os().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.to_str() {
+                Some("-h" | "--help") => {
+                    println!("{USAGE}");
+                    std::process::exit(0);
+                }
+                Some("-d" | "--display-off") => {
+                    let seconds: u64 = args
+                        .next()
+                        .and_then(|s| s.to_str()?.parse().ok())
+                        .unwrap_or_else(|| usage());
+                    options.display_off = (seconds > 0).then(|| Duration::from_secs(seconds));
+                }
+                _ => usage(),
+            }
+        }
+        options
+    }
+}
+
 #[cfg(feature = "renderer-gl")]
 use gl_app as renderer;
 #[cfg(feature = "renderer-pixels")]
@@ -1337,16 +1538,17 @@ use pixels_app as renderer;
 use softbuffer_app as renderer;
 
 fn main() {
+    let options = Options::parse();
     // Make sure we'll be able to unlock before locking.
     let auth = auth::Authenticator::new().unwrap_or_else(|err| fail(&err));
 
     #[cfg(target_os = "linux")]
     if let Some(session) = session_lock::Session::connect() {
-        renderer::run_session_lock(session, auth);
+        renderer::run_session_lock(session, auth, options);
         return;
     }
 
-    renderer::run(auth);
+    renderer::run(auth, options);
 }
 
 #[cfg(feature = "renderer-gl")]
@@ -1432,7 +1634,7 @@ mod gl_app {
         }
     }
 
-    pub fn run(auth: auth::Authenticator) {
+    pub fn run(auth: auth::Authenticator, options: Options) {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let monitors = monitors(&event_loop);
 
@@ -1483,11 +1685,15 @@ mod gl_app {
             })
             .collect();
 
-        run_screens(event_loop, outputs, auth);
+        run_screens(event_loop, outputs, auth, options);
     }
 
     #[cfg(target_os = "linux")]
-    pub fn run_session_lock(session: session_lock::Session, auth: auth::Authenticator) {
+    pub fn run_session_lock(
+        session: session_lock::Session,
+        auth: auth::Authenticator,
+        options: Options,
+    ) {
         let display = unsafe {
             glutin::display::Display::new(
                 session_lock::raw_display_handle(session.display()),
@@ -1504,7 +1710,7 @@ mod gl_app {
             context: Some(context),
             current: None,
         };
-        session_lock::run(session, Box::new(surfaces), auth);
+        session_lock::run(session, Box::new(surfaces), auth, options);
     }
 
     /// Makes GL outputs for Wayland surfaces, all sharing one context.
@@ -1735,7 +1941,7 @@ mod softbuffer_app {
     #[cfg(target_endian = "big")]
     compile_error!("renderer-softbuffer requires a little-endian target.");
 
-    pub fn run(auth: auth::Authenticator) {
+    pub fn run(auth: auth::Authenticator, options: Options) {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
@@ -1744,12 +1950,16 @@ mod softbuffer_app {
                 (SoftbufferOutput::new(window.clone(), size), window, monitor)
             })
             .collect();
-        run_screens(event_loop, outputs, auth);
+        run_screens(event_loop, outputs, auth, options);
     }
 
     #[cfg(target_os = "linux")]
-    pub fn run_session_lock(session: session_lock::Session, auth: auth::Authenticator) {
-        session_lock::run(session, Box::new(SoftbufferSurfaces), auth);
+    pub fn run_session_lock(
+        session: session_lock::Session,
+        auth: auth::Authenticator,
+        options: Options,
+    ) {
+        session_lock::run(session, Box::new(SoftbufferSurfaces), auth, options);
     }
 
     #[cfg(target_os = "linux")]
@@ -1829,7 +2039,7 @@ mod pixels_app {
 
     use crate::cpu_renderer::{ChannelOrder, create_windows, draw_scene};
 
-    pub fn run(auth: auth::Authenticator) {
+    pub fn run(auth: auth::Authenticator, options: Options) {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
@@ -1838,12 +2048,16 @@ mod pixels_app {
                 (output, window, monitor)
             })
             .collect();
-        run_screens(event_loop, outputs, auth);
+        run_screens(event_loop, outputs, auth, options);
     }
 
     #[cfg(target_os = "linux")]
-    pub fn run_session_lock(session: session_lock::Session, auth: auth::Authenticator) {
-        session_lock::run(session, Box::new(PixelsSurfaces), auth);
+    pub fn run_session_lock(
+        session: session_lock::Session,
+        auth: auth::Authenticator,
+        options: Options,
+    ) {
+        session_lock::run(session, Box::new(PixelsSurfaces), auth, options);
     }
 
     #[cfg(target_os = "linux")]

@@ -16,7 +16,9 @@ use smithay_client_toolkit::reexports::client::protocol::wl_output::{self, WlOut
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
-use smithay_client_toolkit::reexports::client::{Connection, EventQueue, Proxy, QueueHandle};
+use smithay_client_toolkit::reexports::client::{
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
+};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::seat::keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers};
 use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
@@ -29,9 +31,13 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat, delegate_session_lock, registry_handlers,
 };
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+    zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
+};
 use winit::dpi::PhysicalSize;
 
-use crate::{FRAME_INTERVAL, Input, Lock, Output, auth, fail, goop};
+use crate::{FRAME_INTERVAL, Idle, Input, Lock, Options, Output, auth, fail, goop};
 
 /// A connection to a compositor that can lock the session.
 pub struct Session {
@@ -148,7 +154,12 @@ pub trait Surfaces {
 }
 
 /// Locks the session, and shows the goop on every output until unlocked.
-pub fn run(session: Session, surfaces: Box<dyn Surfaces>, auth: auth::Authenticator) {
+pub fn run(
+    session: Session,
+    surfaces: Box<dyn Surfaces>,
+    auth: auth::Authenticator,
+    options: Options,
+) {
     let Session {
         conn,
         globals,
@@ -164,6 +175,20 @@ pub fn run(session: Session, surfaces: Box<dyn Surfaces>, auth: auth::Authentica
         .lock(&qh)
         .unwrap_or_else(|err| fail(&format!("cannot lock the session: {err}")));
 
+    // Turn the outputs off like wlopm does.
+    let power = options.display_off.and_then(|timeout| {
+        match globals.bind::<ZwlrOutputPowerManagerV1, _, _>(&qh, 1..=1, ()) {
+            Ok(manager) => Some((Idle::new(timeout), manager)),
+            Err(_) => {
+                eprintln!(
+                    "lavalock: cannot turn the displays off: the compositor doesn't \
+                     support wlr-output-power-management-v1"
+                );
+                None
+            }
+        }
+    });
+
     let mut app = App {
         screens: Vec::new(),
         surfaces,
@@ -177,6 +202,8 @@ pub fn run(session: Session, surfaces: Box<dyn Surfaces>, auth: auth::Authentica
         outputs: OutputState::new(&globals, &qh),
         seats: SeatState::new(&globals, &qh),
         conn: conn.clone(),
+        qh: qh.clone(),
+        power,
         exit: false,
     };
 
@@ -196,6 +223,9 @@ pub fn run(session: Session, surfaces: Box<dyn Surfaces>, auth: auth::Authentica
             .dispatch(None, &mut app)
             .unwrap_or_else(|err| fail(&format!("Wayland error: {err}")));
     }
+    // In case the compositor unlocked the session while the outputs were off.
+    app.wake();
+    let _ = app.conn.flush();
 }
 
 /// The lock surface on one output.
@@ -206,6 +236,27 @@ struct Screen {
     scene: Option<goop::Scene>,
     surface: SessionLockSurface,
     wl_output: WlOutput,
+    /// Controls the output's power while we keep it turned off.
+    power: Option<ZwlrOutputPowerV1>,
+}
+
+impl Screen {
+    fn power_off(&mut self, manager: &ZwlrOutputPowerManagerV1, qh: &QueueHandle<App>) {
+        if self.power.is_none() {
+            let power = manager.get_output_power(&self.wl_output, qh, ());
+            power.set_mode(zwlr_output_power_v1::Mode::Off);
+            self.power = Some(power);
+        }
+    }
+
+    fn power_on(&mut self) {
+        // Let go of the control again, as only one client may have it, and
+        // the output keeps its mode anyway.
+        if let Some(power) = self.power.take() {
+            power.set_mode(zwlr_output_power_v1::Mode::On);
+            power.destroy();
+        }
+    }
 }
 
 struct App {
@@ -222,10 +273,32 @@ struct App {
     outputs: OutputState,
     seats: SeatState,
     conn: Connection,
+    qh: QueueHandle<App>,
+    /// When to turn the outputs off, and what does it, if asked to.
+    power: Option<(Idle, ZwlrOutputPowerManagerV1)>,
     exit: bool,
 }
 
 impl App {
+    fn outputs_off(&self) -> bool {
+        self.power.as_ref().is_some_and(|(idle, _)| idle.off())
+    }
+
+    /// Notes input, which turns the outputs back on.
+    fn input(&mut self) {
+        if let Some((idle, _)) = &mut self.power
+            && idle.input()
+        {
+            self.wake();
+        }
+    }
+
+    fn wake(&mut self) {
+        for screen in &mut self.screens {
+            screen.power_on();
+        }
+    }
+
     fn tick(&mut self) {
         self.lock
             .poll(self.screens.iter_mut().filter_map(|s| s.scene.as_mut()));
@@ -236,16 +309,29 @@ impl App {
                 .lock
                 .unlocked(self.screens.iter().filter_map(|s| s.scene.as_ref()))
         {
+            self.wake();
             // Dropping the lock unlocks the session.
             self.session_lock = None;
             let _ = self.conn.roundtrip();
             self.exit = true;
             return;
         }
+        if let Some((idle, manager)) = &mut self.power
+            && idle.expired()
+        {
+            for screen in &mut self.screens {
+                screen.power_off(manager, &self.qh);
+            }
+        }
+        // Keep the scenes going, e.g. to finish unlocking, but only draw
+        // them while the outputs are on.
+        let draw = !self.outputs_off();
         for screen in &mut self.screens {
             if let (Some(output), Some(scene)) = (&mut screen.output, &mut screen.scene) {
                 scene.advance();
-                output.render(scene);
+                if draw {
+                    output.render(scene);
+                }
             }
         }
     }
@@ -333,12 +419,21 @@ impl OutputHandler for App {
         };
         let surface = self.compositor.create_surface(qh);
         let surface = session_lock.create_lock_surface(surface, &output, qh);
-        self.screens.push(Screen {
+        let mut screen = Screen {
             output: None,
             scene: None,
             surface,
             wl_output: output,
-        });
+            power: None,
+        };
+        // Some monitors come and go as they're turned off and on, so turn
+        // new ones off too.
+        if let Some((idle, manager)) = &self.power
+            && idle.off()
+        {
+            screen.power_off(manager, qh);
+        }
+        self.screens.push(screen);
     }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
@@ -401,6 +496,7 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
+        self.input();
         let input = match event.keysym {
             Keysym::Return | Keysym::KP_Enter => Input::Submit,
             Keysym::Escape | Keysym::BackSpace => Input::Clear,
@@ -464,10 +560,12 @@ impl PointerHandler for App {
         pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        // Hide the cursor, like the windows do.
         for event in events {
-            if let PointerEventKind::Enter { serial } = event.kind {
-                pointer.set_cursor(serial, None, 0, 0);
+            match event.kind {
+                // Hide the cursor, like the windows do.
+                PointerEventKind::Enter { serial } => pointer.set_cursor(serial, None, 0, 0),
+                PointerEventKind::Leave { .. } => {}
+                _ => self.input(),
             }
         }
     }
@@ -501,6 +599,40 @@ impl ProvidesRegistryState for App {
     }
 
     registry_handlers![OutputState, SeatState];
+}
+
+impl Dispatch<ZwlrOutputPowerManagerV1, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrOutputPowerManagerV1,
+        _: <ZwlrOutputPowerManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrOutputPowerV1, ()> for App {
+    fn event(
+        app: &mut Self,
+        power: &ZwlrOutputPowerV1,
+        event: zwlr_output_power_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // E.g. the output can't be turned off, or another client controls
+        // its power. Nothing to do but leave it on.
+        if let zwlr_output_power_v1::Event::Failed = event {
+            for screen in &mut app.screens {
+                if screen.power.as_ref() == Some(power) {
+                    screen.power = None;
+                }
+            }
+            power.destroy();
+        }
+    }
 }
 
 delegate_compositor!(App);
