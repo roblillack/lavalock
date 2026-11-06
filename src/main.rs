@@ -1,3 +1,4 @@
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,9 @@ compile_error!("Enable one of: renderer-gl, renderer-softbuffer, renderer-pixels
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const INITIAL_WIDTH: f64 = 600.0;
 const INITIAL_HEIGHT: f64 = 400.0;
+
+#[cfg(target_os = "linux")]
+mod session_lock;
 
 mod rng {
     use std::cell::Cell;
@@ -1093,9 +1097,8 @@ fn enter_fullscreen(window: &Window, monitor: &Option<MonitorHandle>) {
     window.set_cursor_visible(window.fullscreen().is_none());
 }
 
-/// A window plus whatever a renderer needs to draw into it.
+/// Draws scenes, into a window or a Wayland surface.
 trait Output {
-    fn window(&self) -> &Window;
     fn resize(&mut self, size: PhysicalSize<u32>);
     fn render(&mut self, scene: &goop::Scene);
 }
@@ -1105,17 +1108,20 @@ trait Output {
 const MAX_FULLSCREEN_RETRIES: u32 = 3;
 
 struct Screen<O> {
+    // Dropped before the window it draws into.
     output: O,
+    window: Rc<Window>,
     monitor: Option<MonitorHandle>,
     fullscreen_retries: u32,
     scene: goop::Scene,
 }
 
 impl<O: Output> Screen<O> {
-    fn new((output, monitor): (O, Option<MonitorHandle>)) -> Self {
-        let size = output.window().inner_size();
+    fn new((output, window, monitor): (O, Rc<Window>, Option<MonitorHandle>)) -> Self {
+        let size = window.inner_size();
         Self {
             output,
+            window,
             monitor,
             fullscreen_retries: 0,
             scene: goop::Scene::new(size.width as f64, size.height as f64),
@@ -1125,7 +1131,7 @@ impl<O: Output> Screen<O> {
     fn resize(&mut self, size: PhysicalSize<u32>) {
         self.output.resize(size);
         self.scene = self.scene.resized(size.width as f64, size.height as f64);
-        let window = self.output.window();
+        let window = &self.window;
         // Some compositors (e.g. River) drop a window out of fullscreen when
         // the next window gets mapped, so request it again.
         if window.fullscreen().is_none() && self.fullscreen_retries < MAX_FULLSCREEN_RETRIES {
@@ -1134,6 +1140,28 @@ impl<O: Output> Screen<O> {
         }
         window.set_cursor_visible(window.fullscreen().is_none());
         window.request_redraw();
+    }
+}
+
+/// What a key press means for the lock.
+enum Input<'a> {
+    /// Check the password.
+    Submit,
+    /// Forget what was typed so far.
+    Clear,
+    Text(&'a str),
+}
+
+impl Input<'_> {
+    fn from_winit(event: &KeyEvent) -> Option<Input<'_>> {
+        if event.state != ElementState::Pressed {
+            return None;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => Some(Input::Submit),
+            Key::Named(NamedKey::Escape | NamedKey::Backspace) => Some(Input::Clear),
+            _ => event.text.as_deref().map(Input::Text),
+        }
     }
 }
 
@@ -1156,25 +1184,26 @@ impl Lock {
         }
     }
 
-    fn key<O>(&mut self, event: &KeyEvent, screens: &mut [Screen<O>]) {
-        if event.state != ElementState::Pressed || self.checking.is_some() || self.unlocking {
+    fn input<'a>(&mut self, input: Input, scenes: impl IntoIterator<Item = &'a mut goop::Scene>) {
+        if self.checking.is_some() || self.unlocking {
             return;
         }
-        match &event.logical_key {
-            Key::Named(NamedKey::Enter) => {
+        match input {
+            Input::Submit => {
                 if !self.password.is_empty() {
                     self.checking = Some(self.auth.check(self.password.take()));
-                    each_scene(screens, |scene| scene.set_spinning(true));
+                    for scene in scenes {
+                        scene.set_spinning(true);
+                    }
                 }
             }
-            Key::Named(NamedKey::Escape | NamedKey::Backspace) => {
+            Input::Clear => {
                 self.password.clear();
-                each_scene(screens, |scene| scene.set_formation(goop::Formation::Free));
+                for scene in scenes {
+                    scene.set_formation(goop::Formation::Free);
+                }
             }
-            _ => {
-                let Some(text) = &event.text else {
-                    return;
-                };
+            Input::Text(text) => {
                 let mut typed = false;
                 for ch in text.chars().filter(|c| !c.is_control()) {
                     typed |= self.password.push(ch);
@@ -1186,21 +1215,21 @@ impl Lock {
                     // comparing screens would give the count away.
                     let gathering_turns = rng::range(4) as u32;
                     let turns = 1 + rng::range(4) as u32;
-                    each_scene(screens, |scene| {
+                    for scene in scenes {
                         if scene.formation() == goop::Formation::Ring {
                             scene.nudge(turns);
                         } else {
                             scene.set_formation(goop::Formation::Ring);
                             scene.nudge(gathering_turns);
                         }
-                    });
+                    }
                 }
             }
         }
     }
 
     /// Picks up the result of a password check, if there is one by now.
-    fn poll<O>(&mut self, screens: &mut [Screen<O>]) {
+    fn poll<'a>(&mut self, scenes: impl IntoIterator<Item = &'a mut goop::Scene>) {
         let Some(result) = &self.checking else {
             return;
         };
@@ -1213,32 +1242,26 @@ impl Lock {
             Ok(false) | Err(TryRecvError::Disconnected) => goop::Formation::Line,
         };
         self.checking = None;
-        each_scene(screens, |scene| {
+        for scene in scenes {
             scene.set_spinning(false);
             scene.set_formation(formation);
-        });
+        }
     }
 
     /// Whether the screens are unlocked and done animating.
-    fn unlocked<O>(&self, screens: &[Screen<O>]) -> bool {
-        self.unlocking && screens.iter().all(|screen| screen.scene.finished())
-    }
-}
-
-fn each_scene<O>(screens: &mut [Screen<O>], f: impl Fn(&mut goop::Scene)) {
-    for screen in screens {
-        f(&mut screen.scene);
+    fn unlocked<'a>(&self, mut scenes: impl Iterator<Item = &'a goop::Scene>) -> bool {
+        self.unlocking && scenes.all(|scene| scene.finished())
     }
 }
 
 fn run_screens<O: Output>(
     event_loop: EventLoop<()>,
-    outputs: Vec<(O, Option<MonitorHandle>)>,
+    outputs: Vec<(O, Rc<Window>, Option<MonitorHandle>)>,
     auth: auth::Authenticator,
 ) {
     let mut screens: Vec<Screen<O>> = outputs.into_iter().map(Screen::new).collect();
     let mut lock = Lock::new(auth);
-    let mut grab = grab::Grab::new(screens[0].output.window()).unwrap_or_else(|err| fail(&err));
+    let mut grab = grab::Grab::new(&screens[0].window).unwrap_or_else(|err| fail(&err));
     let mut next_tick = Instant::now();
 
     event_loop
@@ -1247,10 +1270,7 @@ fn run_screens<O: Output>(
 
             match event {
                 Event::WindowEvent { window_id, event } => {
-                    let Some(i) = screens
-                        .iter()
-                        .position(|s| s.output.window().id() == window_id)
-                    else {
+                    let Some(i) = screens.iter().position(|s| s.window.id() == window_id) else {
                         return;
                     };
                     match event {
@@ -1259,7 +1279,7 @@ fn run_screens<O: Output>(
                             mut inner_size_writer,
                             ..
                         } => {
-                            let size = screens[i].output.window().inner_size();
+                            let size = screens[i].window.inner_size();
                             let _ = inner_size_writer.request_inner_size(size);
                             screens[i].resize(size);
                         }
@@ -1269,7 +1289,11 @@ fn run_screens<O: Output>(
                             event,
                             is_synthetic: false,
                             ..
-                        } => lock.key(&event, &mut screens),
+                        } => {
+                            if let Some(input) = Input::from_winit(&event) {
+                                lock.input(input, screens.iter_mut().map(|s| &mut s.scene));
+                            }
+                        }
                         WindowEvent::RedrawRequested => {
                             let screen = &mut screens[i];
                             screen.scene.advance();
@@ -1281,7 +1305,7 @@ fn run_screens<O: Output>(
                 }
                 Event::NewEvents(StartCause::ResumeTimeReached { .. })
                 | Event::NewEvents(StartCause::Init) => {
-                    if lock.unlocked(&screens) {
+                    if lock.unlocked(screens.iter().map(|s| &s.scene)) {
                         elwt.exit();
                         return;
                     }
@@ -1289,9 +1313,9 @@ fn run_screens<O: Output>(
                         // Better not to lock at all than to only look locked.
                         grab.update().unwrap_or_else(|err| fail(err));
                     }
-                    lock.poll(&mut screens);
+                    lock.poll(screens.iter_mut().map(|s| &mut s.scene));
                     for screen in &screens {
-                        screen.output.window().request_redraw();
+                        screen.window.request_redraw();
                     }
                 }
                 _ => {}
@@ -1305,75 +1329,118 @@ fn fail(err: &str) -> ! {
     std::process::exit(1);
 }
 
+#[cfg(feature = "renderer-gl")]
+use gl_app as renderer;
+#[cfg(feature = "renderer-pixels")]
+use pixels_app as renderer;
+#[cfg(feature = "renderer-softbuffer")]
+use softbuffer_app as renderer;
+
 fn main() {
     // Make sure we'll be able to unlock before locking.
     let auth = auth::Authenticator::new().unwrap_or_else(|err| fail(&err));
 
-    #[cfg(feature = "renderer-gl")]
-    {
-        gl_app::run(auth);
+    #[cfg(target_os = "linux")]
+    if let Some(session) = session_lock::Session::connect() {
+        renderer::run_session_lock(session, auth);
+        return;
     }
 
-    #[cfg(feature = "renderer-softbuffer")]
-    {
-        softbuffer_app::run(auth);
-    }
-
-    #[cfg(feature = "renderer-pixels")]
-    {
-        pixels_app::run(auth);
-    }
+    renderer::run(auth);
 }
 
 #[cfg(feature = "renderer-gl")]
 mod gl_app {
     use super::*;
     use std::num::NonZeroU32;
-    use std::rc::Rc;
 
     use femtovg::renderer::OpenGl;
     use femtovg::{Canvas, Color, Paint, Path};
     use glutin::config::{Config, ConfigTemplateBuilder};
-    use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
+    use glutin::context::{
+        ContextApi, ContextAttributesBuilder, NotCurrentContext, PossiblyCurrentContext, Version,
+    };
     use glutin::display::GetGlDisplay;
     use glutin::prelude::*;
     use glutin::surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
     use glutin_winit::DisplayBuilder;
-    use raw_window_handle::HasRawWindowHandle;
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+
+    /// Transparent, so that the desktop shows once we fade out after
+    /// unlocking.
+    fn template() -> ConfigTemplateBuilder {
+        ConfigTemplateBuilder::new()
+            .with_alpha_size(8)
+            .with_depth_size(24)
+            .with_stencil_size(8)
+            .with_transparency(true)
+    }
+
+    /// Prefers transparency, then more samples.
+    fn best_config(configs: Box<dyn Iterator<Item = Config> + '_>) -> Config {
+        let transparent = |c: &Config| c.supports_transparency().unwrap_or(false);
+        configs
+            .reduce(|accum, config| {
+                let more_transparent = transparent(&config) && !transparent(&accum);
+                let as_transparent = transparent(&config) == transparent(&accum);
+                if more_transparent
+                    || (as_transparent && config.num_samples() > accum.num_samples())
+                {
+                    config
+                } else {
+                    accum
+                }
+            })
+            .expect("No GL config")
+    }
+
+    fn create_context(gl_config: &Config, handle: Option<RawWindowHandle>) -> NotCurrentContext {
+        let context_attributes = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
+            .build(handle);
+        let fallback_attributes = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::Gles(Some(Version::new(3, 0))))
+            .build(handle);
+        unsafe {
+            gl_config
+                .display()
+                .create_context(gl_config, &context_attributes)
+                .or_else(|_| {
+                    gl_config
+                        .display()
+                        .create_context(gl_config, &fallback_attributes)
+                })
+                .expect("Failed to create GL context")
+        }
+    }
+
+    fn create_surface(
+        gl_config: &Config,
+        handle: RawWindowHandle,
+        size: PhysicalSize<u32>,
+    ) -> Surface<WindowSurface> {
+        let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            handle,
+            NonZeroU32::new(size.width.max(1)).unwrap(),
+            NonZeroU32::new(size.height.max(1)).unwrap(),
+        );
+        unsafe {
+            gl_config
+                .display()
+                .create_window_surface(gl_config, &surface_attributes)
+                .expect("Failed to create GL surface")
+        }
+    }
 
     pub fn run(auth: auth::Authenticator) {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let monitors = monitors(&event_loop);
 
-        // Transparent, so that the desktop shows once we fade out after
-        // unlocking.
-        let template = ConfigTemplateBuilder::new()
-            .with_alpha_size(8)
-            .with_depth_size(24)
-            .with_stencil_size(8)
-            .with_transparency(true);
         let window_builder = |monitor| window_builder(monitor).with_transparent(true);
-
         let display_builder =
             DisplayBuilder::new().with_window_builder(Some(window_builder(&monitors[0])));
-
         let (window, gl_config) = display_builder
-            .build(&event_loop, template, |configs| {
-                let transparent = |c: &Config| c.supports_transparency().unwrap_or(false);
-                configs
-                    .reduce(|accum, config| {
-                        let more_transparent = transparent(&config) && !transparent(&accum);
-                        let as_transparent = transparent(&config) == transparent(&accum);
-                        if more_transparent
-                            || (as_transparent && config.num_samples() > accum.num_samples())
-                        {
-                            config
-                        } else {
-                            accum
-                        }
-                    })
-                    .unwrap()
-            })
+            .build(&event_loop, template(), best_config)
             .expect("Failed to create display");
 
         // The remaining windows must use the same GL config so that a single
@@ -1389,29 +1456,14 @@ mod gl_app {
             enter_fullscreen(window, monitor);
         }
 
-        let raw_window_handle = windows[0].raw_window_handle();
-        let context_attributes = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
-            .build(Some(raw_window_handle));
-        let fallback_attributes = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::Gles(Some(Version::new(3, 0))))
-            .build(Some(raw_window_handle));
-
-        let not_current_gl_context = unsafe {
-            gl_config
-                .display()
-                .create_context(&gl_config, &context_attributes)
-                .or_else(|_| {
-                    gl_config
-                        .display()
-                        .create_context(&gl_config, &fallback_attributes)
-                })
-                .expect("Failed to create GL context")
-        };
+        let not_current_gl_context =
+            create_context(&gl_config, Some(windows[0].raw_window_handle()));
 
         let surfaces: Vec<_> = windows
             .iter()
-            .map(|window| create_surface(&gl_config, window))
+            .map(|window| {
+                create_surface(&gl_config, window.raw_window_handle(), window.inner_size())
+            })
             .collect();
 
         let gl_context = Rc::new(
@@ -1425,43 +1477,84 @@ mod gl_app {
             .zip(surfaces)
             .zip(monitors)
             .map(|((window, surface), monitor)| {
-                let output = GlOutput::new(window, surface, gl_context.clone(), &gl_config);
-                (output, monitor)
+                let size = window.inner_size();
+                let output = GlOutput::new(surface, gl_context.clone(), &gl_config, size);
+                (output, Rc::new(window), monitor)
             })
             .collect();
 
         run_screens(event_loop, outputs, auth);
     }
 
-    fn create_surface(gl_config: &Config, window: &Window) -> Surface<WindowSurface> {
-        let size = window.inner_size();
-        let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            window.raw_window_handle(),
-            NonZeroU32::new(size.width.max(1)).unwrap(),
-            NonZeroU32::new(size.height.max(1)).unwrap(),
-        );
-        unsafe {
-            gl_config
-                .display()
-                .create_window_surface(gl_config, &surface_attributes)
-                .expect("Failed to create GL surface")
+    #[cfg(target_os = "linux")]
+    pub fn run_session_lock(session: session_lock::Session, auth: auth::Authenticator) {
+        let display = unsafe {
+            glutin::display::Display::new(
+                session_lock::raw_display_handle(session.display()),
+                glutin::display::DisplayApiPreference::Egl,
+            )
+        }
+        .unwrap_or_else(|err| fail(&format!("cannot use EGL: {err}")));
+        let configs = unsafe { display.find_configs(template().build()) }
+            .unwrap_or_else(|err| fail(&format!("no EGL config: {err}")));
+        let gl_config = best_config(configs);
+        let context = create_context(&gl_config, None);
+        let surfaces = GlSurfaces {
+            gl_config,
+            context: Some(context),
+            current: None,
+        };
+        session_lock::run(session, Box::new(surfaces), auth);
+    }
+
+    /// Makes GL outputs for Wayland surfaces, all sharing one context.
+    #[cfg(target_os = "linux")]
+    struct GlSurfaces {
+        gl_config: Config,
+        /// The context until it's made current with the first surface.
+        context: Option<NotCurrentContext>,
+        current: Option<Rc<PossiblyCurrentContext>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl session_lock::Surfaces for GlSurfaces {
+        fn create(
+            &mut self,
+            surface: session_lock::SurfaceHandle,
+            size: PhysicalSize<u32>,
+        ) -> Box<dyn Output> {
+            let surface = create_surface(&self.gl_config, surface.raw_window_handle(), size);
+            let context = match (&self.current, self.context.take()) {
+                (Some(current), _) => current.clone(),
+                (None, Some(context)) => {
+                    let current = Rc::new(
+                        context
+                            .make_current(&surface)
+                            .expect("Failed to make GL context current"),
+                    );
+                    self.current = Some(current.clone());
+                    current
+                }
+                (None, None) => unreachable!(),
+            };
+            Box::new(GlOutput::new(surface, context, &self.gl_config, size))
         }
     }
 
     struct GlOutput {
-        // Field order matters: GL resources go before the context and window.
+        // Field order matters: GL resources go before the context.
         canvas: Canvas<OpenGl>,
         surface: Surface<WindowSurface>,
         context: Rc<PossiblyCurrentContext>,
-        window: Window,
+        size: PhysicalSize<u32>,
     }
 
     impl GlOutput {
         fn new(
-            window: Window,
             surface: Surface<WindowSurface>,
             context: Rc<PossiblyCurrentContext>,
             gl_config: &Config,
+            size: PhysicalSize<u32>,
         ) -> Self {
             context
                 .make_current(&surface)
@@ -1483,7 +1576,7 @@ mod gl_app {
                 canvas,
                 surface,
                 context,
-                window,
+                size,
             }
         }
 
@@ -1495,20 +1588,17 @@ mod gl_app {
     }
 
     impl Output for GlOutput {
-        fn window(&self) -> &Window {
-            &self.window
-        }
-
         fn resize(&mut self, size: PhysicalSize<u32>) {
             self.make_current();
-            let width = NonZeroU32::new(size.width.max(1)).unwrap();
-            let height = NonZeroU32::new(size.height.max(1)).unwrap();
+            self.size = PhysicalSize::new(size.width.max(1), size.height.max(1));
+            let width = NonZeroU32::new(self.size.width).unwrap();
+            let height = NonZeroU32::new(self.size.height).unwrap();
             self.surface.resize(&self.context, width, height);
         }
 
         fn render(&mut self, scene: &goop::Scene) {
             self.make_current();
-            let size = self.window.inner_size();
+            let size = self.size;
             // femtovg only applies the GL viewport in set_size, and the
             // viewport is context state shared by all windows, so it has to
             // be set again before every frame.
@@ -1557,7 +1647,7 @@ mod cpu_renderer {
     use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
 
     /// One fullscreen window per monitor.
-    pub fn create_windows(event_loop: &EventLoop<()>) -> Vec<(Window, Option<MonitorHandle>)> {
+    pub fn create_windows(event_loop: &EventLoop<()>) -> Vec<(Rc<Window>, Option<MonitorHandle>)> {
         monitors(event_loop)
             .into_iter()
             .map(|monitor| {
@@ -1565,7 +1655,7 @@ mod cpu_renderer {
                     .build(event_loop)
                     .expect("Failed to create window");
                 enter_fullscreen(&window, &monitor);
-                (window, monitor)
+                (Rc::new(window), monitor)
             })
             .collect()
     }
@@ -1635,8 +1725,8 @@ mod softbuffer_app {
 
     use softbuffer::{Context, Surface};
     use std::num::NonZeroU32;
-    use std::rc::Rc;
     use tiny_skia::PixmapMut;
+    use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
     use crate::cpu_renderer::{ChannelOrder, create_windows, draw_scene};
 
@@ -1649,41 +1739,55 @@ mod softbuffer_app {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
-            .map(|(window, monitor)| (SoftbufferOutput::new(window), monitor))
+            .map(|(window, monitor)| {
+                let size = window.inner_size();
+                (SoftbufferOutput::new(window.clone(), size), window, monitor)
+            })
             .collect();
         run_screens(event_loop, outputs, auth);
     }
 
-    struct SoftbufferOutput {
-        surface: Surface<Rc<Window>, Rc<Window>>,
-        _context: Context<Rc<Window>>,
-        size: PhysicalSize<u32>,
-        window: Rc<Window>,
+    #[cfg(target_os = "linux")]
+    pub fn run_session_lock(session: session_lock::Session, auth: auth::Authenticator) {
+        session_lock::run(session, Box::new(SoftbufferSurfaces), auth);
     }
 
-    impl SoftbufferOutput {
-        fn new(window: Window) -> Self {
-            let window = Rc::new(window);
+    #[cfg(target_os = "linux")]
+    struct SoftbufferSurfaces;
+
+    #[cfg(target_os = "linux")]
+    impl session_lock::Surfaces for SoftbufferSurfaces {
+        fn create(
+            &mut self,
+            surface: session_lock::SurfaceHandle,
+            size: PhysicalSize<u32>,
+        ) -> Box<dyn Output> {
+            Box::new(SoftbufferOutput::new(surface, size))
+        }
+    }
+
+    struct SoftbufferOutput<H: HasDisplayHandle + HasWindowHandle> {
+        surface: Surface<H, H>,
+        _context: Context<H>,
+        size: PhysicalSize<u32>,
+    }
+
+    impl<H: HasDisplayHandle + HasWindowHandle + Clone> SoftbufferOutput<H> {
+        fn new(handle: H, size: PhysicalSize<u32>) -> Self {
             let context =
-                Context::new(window.clone()).expect("Failed to create softbuffer context");
-            let surface = Surface::new(&context, window.clone()).expect("Failed to create surface");
-            let size = window.inner_size();
+                Context::new(handle.clone()).expect("Failed to create softbuffer context");
+            let surface = Surface::new(&context, handle).expect("Failed to create surface");
             let mut output = Self {
                 surface,
                 _context: context,
                 size,
-                window,
             };
             output.resize(size);
             output
         }
     }
 
-    impl Output for SoftbufferOutput {
-        fn window(&self) -> &Window {
-            &self.window
-        }
-
+    impl<H: HasDisplayHandle + HasWindowHandle> Output for SoftbufferOutput<H> {
         fn resize(&mut self, size: PhysicalSize<u32>) {
             self.size = PhysicalSize::new(size.width.max(1), size.height.max(1));
             self.surface
@@ -1720,6 +1824,7 @@ mod pixels_app {
     use super::*;
 
     use pixels::{PixelsBuilder, SurfaceTexture};
+    use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
     use tiny_skia::PixmapMut;
 
     use crate::cpu_renderer::{ChannelOrder, create_windows, draw_scene};
@@ -1728,41 +1833,57 @@ mod pixels_app {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
         let outputs = create_windows(&event_loop)
             .into_iter()
-            .map(|(window, monitor)| (PixelsOutput::new(window), monitor))
+            .map(|(window, monitor)| {
+                let output = PixelsOutput::new(&*window, window.inner_size());
+                (output, window, monitor)
+            })
             .collect();
         run_screens(event_loop, outputs, auth);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn run_session_lock(session: session_lock::Session, auth: auth::Authenticator) {
+        session_lock::run(session, Box::new(PixelsSurfaces), auth);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PixelsSurfaces;
+
+    #[cfg(target_os = "linux")]
+    impl session_lock::Surfaces for PixelsSurfaces {
+        fn create(
+            &mut self,
+            surface: session_lock::SurfaceHandle,
+            size: PhysicalSize<u32>,
+        ) -> Box<dyn Output> {
+            Box::new(PixelsOutput::new(&surface, size))
+        }
     }
 
     struct PixelsOutput {
         pixels: pixels::Pixels,
         size: PhysicalSize<u32>,
-        window: Window,
     }
 
     impl PixelsOutput {
-        fn new(window: Window) -> Self {
-            let size = window.inner_size();
+        /// The window or surface must outlive the output.
+        fn new<W: HasRawWindowHandle + HasRawDisplayHandle>(
+            window: &W,
+            size: PhysicalSize<u32>,
+        ) -> Self {
             let surface_texture =
-                SurfaceTexture::new(size.width.max(1), size.height.max(1), &window);
+                SurfaceTexture::new(size.width.max(1), size.height.max(1), window);
             // As with GL: waiting for vblank in every window's render would
             // stall the frame loop once per monitor. FRAME_INTERVAL paces.
             let pixels = PixelsBuilder::new(size.width.max(1), size.height.max(1), surface_texture)
                 .enable_vsync(false)
                 .build()
                 .expect("Failed to create Pixels surface");
-            Self {
-                pixels,
-                size,
-                window,
-            }
+            Self { pixels, size }
         }
     }
 
     impl Output for PixelsOutput {
-        fn window(&self) -> &Window {
-            &self.window
-        }
-
         fn resize(&mut self, size: PhysicalSize<u32>) {
             self.size = size;
             let _ = self

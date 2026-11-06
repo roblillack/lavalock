@@ -16,11 +16,14 @@ tiny-skia = { version = "0.11", optional = true }
 winit = { version = "0.29", features = ["rwh_05"] }
 x11-dl = "2.21"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-client-toolkit = "0.18"
+
 [features]
 default = ["renderer-gl"]
 renderer-gl = ["dep:femtovg", "dep:glutin", "dep:glutin-winit", "dep:raw-window-handle"]
 renderer-softbuffer = ["dep:bytemuck", "dep:softbuffer", "dep:tiny-skia"]
-renderer-pixels = ["dep:pixels", "dep:tiny-skia"]
+renderer-pixels = ["dep:pixels", "dep:raw-window-handle", "dep:tiny-skia"]
 
 [profile.release]
 opt-level = "z"
