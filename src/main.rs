@@ -963,6 +963,110 @@ mod auth {
     }
 }
 
+/// Keeps all keyboard and pointer input to ourselves on X11, like slock, so
+/// that no other program sees what's typed and no window manager shortcut
+/// can get around us. Wayland compositors don't let programs do this.
+mod grab {
+    use std::ffi::c_uint;
+    use std::time::{Duration, Instant};
+
+    use winit::raw_window_handle::{
+        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+    };
+    use winit::window::Window;
+    use x11_dl::xlib;
+
+    /// How long to keep trying at startup, e.g. while a menu that was open
+    /// still holds the keyboard. slock waits as long.
+    const STARTUP_TIMEOUT: Duration = Duration::from_secs(1);
+    /// How often to grab again, in case we lost the grab, e.g. because the
+    /// window got unmapped.
+    const REGRAB_INTERVAL: Duration = Duration::from_secs(1);
+
+    pub struct Grab {
+        xlib: xlib::Xlib,
+        display: *mut xlib::Display,
+        window: xlib::Window,
+        deadline: Instant,
+        grabbed: bool,
+        next_try: Instant,
+    }
+
+    impl Grab {
+        /// Prepares grabbing input for the window, if it is on X11.
+        pub fn new(window: &Window) -> Result<Option<Self>, String> {
+            let (Ok(display), Ok(handle)) = (window.display_handle(), window.window_handle())
+            else {
+                return Ok(None);
+            };
+            let (RawDisplayHandle::Xlib(display), RawWindowHandle::Xlib(handle)) =
+                (display.as_raw(), handle.as_raw())
+            else {
+                return Ok(None);
+            };
+            let display = display.display.ok_or("no X11 display to grab input on")?;
+            let xlib = xlib::Xlib::open().map_err(|err| format!("cannot load Xlib: {err}"))?;
+            let now = Instant::now();
+            Ok(Some(Self {
+                xlib,
+                // Winit's own connection: grabs belong to a connection, and
+                // winit has to receive the grabbed input.
+                display: display.as_ptr().cast(),
+                window: handle.window,
+                deadline: now + STARTUP_TIMEOUT,
+                grabbed: false,
+                next_try: now,
+            }))
+        }
+
+        /// Grabs input, if it's time to. Fails if we couldn't grab it in time
+        /// at startup.
+        pub fn update(&mut self) -> Result<(), &'static str> {
+            let now = Instant::now();
+            if now < self.next_try {
+                return Ok(());
+            }
+            let x = &self.xlib;
+            let keyboard = unsafe {
+                (x.XGrabKeyboard)(
+                    self.display,
+                    self.window,
+                    xlib::True,
+                    xlib::GrabModeAsync,
+                    xlib::GrabModeAsync,
+                    xlib::CurrentTime,
+                )
+            } == xlib::GrabSuccess;
+            let mask = xlib::ButtonPressMask | xlib::ButtonReleaseMask | xlib::PointerMotionMask;
+            let pointer = unsafe {
+                (x.XGrabPointer)(
+                    self.display,
+                    self.window,
+                    xlib::False,
+                    mask as c_uint,
+                    xlib::GrabModeAsync,
+                    xlib::GrabModeAsync,
+                    0, // Don't confine the pointer.
+                    0, // Keep the window's (hidden) cursor.
+                    xlib::CurrentTime,
+                )
+            } == xlib::GrabSuccess;
+
+            if keyboard && pointer {
+                self.grabbed = true;
+                self.next_try = now + REGRAB_INTERVAL;
+            } else if !self.grabbed && now >= self.deadline {
+                return Err(if keyboard {
+                    "cannot grab the pointer"
+                } else {
+                    "cannot grab the keyboard"
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 /// The monitors to cover, one window each. Falls back to a single window on
 /// the current monitor if the platform doesn't report any.
 fn monitors(elwt: &EventLoopWindowTarget<()>) -> Vec<Option<MonitorHandle>> {
@@ -1134,6 +1238,7 @@ fn run_screens<O: Output>(
 ) {
     let mut screens: Vec<Screen<O>> = outputs.into_iter().map(Screen::new).collect();
     let mut lock = Lock::new(auth);
+    let mut grab = grab::Grab::new(screens[0].output.window()).unwrap_or_else(|err| fail(&err));
     let mut next_tick = Instant::now();
 
     event_loop
@@ -1179,6 +1284,10 @@ fn run_screens<O: Output>(
                     if lock.unlocked(&screens) {
                         elwt.exit();
                         return;
+                    }
+                    if let Some(grab) = &mut grab {
+                        // Better not to lock at all than to only look locked.
+                        grab.update().unwrap_or_else(|err| fail(err));
                     }
                     lock.poll(&mut screens);
                     for screen in &screens {

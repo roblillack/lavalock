@@ -949,6 +949,7 @@ dependencies = [
  "softbuffer",
  "tiny-skia",
  "winit",
+ "x11-dl",
 ]
 
 [[package]]
