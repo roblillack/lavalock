@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, Event, StartCause, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
-use winit::window::{Fullscreen, WindowBuilder};
+use winit::event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget};
+use winit::monitor::MonitorHandle;
+use winit::window::{Fullscreen, Window, WindowBuilder};
 
 #[cfg(all(
     feature = "renderer-gl",
@@ -319,12 +320,120 @@ mod goop {
     }
 }
 
-struct AppState {
+fn is_key_press(event: &winit::event::KeyEvent) -> bool {
+    event.state == ElementState::Pressed
+}
+
+/// The monitors to cover, one window each. Falls back to a single window on
+/// the current monitor if the platform doesn't report any.
+fn monitors(elwt: &EventLoopWindowTarget<()>) -> Vec<Option<MonitorHandle>> {
+    let monitors: Vec<_> = elwt.available_monitors().map(Some).collect();
+    if monitors.is_empty() {
+        vec![None]
+    } else {
+        monitors
+    }
+}
+
+fn window_builder(monitor: &Option<MonitorHandle>) -> WindowBuilder {
+    let mut builder = WindowBuilder::new()
+        .with_title("Goop")
+        .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT));
+    if let Some(monitor) = monitor {
+        builder = builder.with_position(monitor.position());
+    }
+    builder.with_fullscreen(Some(Fullscreen::Borderless(monitor.clone())))
+}
+
+fn enter_fullscreen(window: &Window, monitor: Option<MonitorHandle>) {
+    window.set_fullscreen(Some(Fullscreen::Borderless(monitor)));
+    window.set_cursor_visible(window.fullscreen().is_none());
+}
+
+/// A window plus whatever a renderer needs to draw into it.
+trait Output {
+    fn window(&self) -> &Window;
+    fn resize(&mut self, size: PhysicalSize<u32>);
+    fn render(&mut self, scene: &goop::Scene);
+}
+
+struct Screen<O> {
+    output: O,
     scene: goop::Scene,
 }
 
-fn is_key_press(event: &winit::event::KeyEvent) -> bool {
-    event.state == ElementState::Pressed
+impl<O: Output> Screen<O> {
+    fn new(output: O) -> Self {
+        let size = output.window().inner_size();
+        Self {
+            output,
+            scene: goop::Scene::new(size.width as f64, size.height as f64),
+        }
+    }
+
+    fn resize(&mut self, size: PhysicalSize<u32>) {
+        self.output.resize(size);
+        self.scene = goop::Scene::new(size.width as f64, size.height as f64);
+        let window = self.output.window();
+        window.set_cursor_visible(window.fullscreen().is_none());
+        window.request_redraw();
+    }
+}
+
+fn run_screens<O: Output>(event_loop: EventLoop<()>, outputs: Vec<O>) {
+    let mut screens: Vec<Screen<O>> = outputs.into_iter().map(Screen::new).collect();
+    let mut next_tick = Instant::now();
+
+    event_loop
+        .run(move |event, elwt| {
+            elwt.set_control_flow(ControlFlow::WaitUntil(next_tick));
+
+            match event {
+                Event::WindowEvent { window_id, event } => {
+                    let Some(screen) = screens
+                        .iter_mut()
+                        .find(|s| s.output.window().id() == window_id)
+                    else {
+                        return;
+                    };
+                    match event {
+                        WindowEvent::CloseRequested => elwt.exit(),
+                        WindowEvent::Resized(size) => screen.resize(size),
+                        WindowEvent::ScaleFactorChanged {
+                            mut inner_size_writer,
+                            ..
+                        } => {
+                            let size = screen.output.window().inner_size();
+                            let _ = inner_size_writer.request_inner_size(size);
+                            screen.resize(size);
+                        }
+                        WindowEvent::KeyboardInput { event, .. } => {
+                            if is_key_press(&event) {
+                                elwt.exit();
+                            }
+                        }
+                        WindowEvent::MouseInput {
+                            state: ElementState::Pressed,
+                            ..
+                        } => elwt.exit(),
+                        WindowEvent::RedrawRequested => {
+                            screen.scene.advance();
+                            screen.output.render(&screen.scene);
+                            next_tick = Instant::now() + FRAME_INTERVAL;
+                        }
+                        _ => {}
+                    }
+                }
+                Event::NewEvents(StartCause::ResumeTimeReached { .. })
+                | Event::NewEvents(StartCause::Init) => {
+                    for screen in &screens {
+                        screen.output.window().request_redraw();
+                    }
+                }
+                _ => {}
+            }
+        })
+        .expect("Event loop error");
 }
 
 fn main() {
@@ -348,31 +457,29 @@ fn main() {
 mod gl_app {
     use super::*;
     use std::num::NonZeroU32;
+    use std::rc::Rc;
 
     use femtovg::renderer::OpenGl;
     use femtovg::{Canvas, Color, Paint, Path};
-    use glutin::config::ConfigTemplateBuilder;
-    use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
+    use glutin::config::{Config, ConfigTemplateBuilder};
+    use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
     use glutin::display::GetGlDisplay;
     use glutin::prelude::*;
-    use glutin::surface::{SurfaceAttributesBuilder, WindowSurface};
+    use glutin::surface::{Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
     use glutin_winit::DisplayBuilder;
     use raw_window_handle::HasRawWindowHandle;
-    use winit::dpi::PhysicalSize;
 
     pub fn run() {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
-        let window_builder = WindowBuilder::new()
-            .with_title("Goop")
-            .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
-            .with_fullscreen(Some(Fullscreen::Borderless(None)));
+        let monitors = monitors(&event_loop);
 
         let template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
             .with_depth_size(24)
             .with_stencil_size(8);
 
-        let display_builder = DisplayBuilder::new().with_window_builder(Some(window_builder));
+        let display_builder =
+            DisplayBuilder::new().with_window_builder(Some(window_builder(&monitors[0])));
 
         let (window, gl_config) = display_builder
             .build(&event_loop, template, |configs| {
@@ -388,10 +495,20 @@ mod gl_app {
             })
             .expect("Failed to create display");
 
-        let window = window.expect("Window wasn't created");
-        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        let raw_window_handle = window.raw_window_handle();
+        // The remaining windows must use the same GL config so that a single
+        // context can render into all of them.
+        let mut windows = vec![window.expect("Window wasn't created")];
+        for monitor in &monitors[1..] {
+            windows.push(
+                glutin_winit::finalize_window(&event_loop, window_builder(monitor), &gl_config)
+                    .expect("Failed to create window"),
+            );
+        }
+        for (window, monitor) in windows.iter().zip(monitors) {
+            enter_fullscreen(window, monitor);
+        }
 
+        let raw_window_handle = windows[0].raw_window_handle();
         let context_attributes = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
             .build(Some(raw_window_handle));
@@ -411,105 +528,110 @@ mod gl_app {
                 .expect("Failed to create GL context")
         };
 
-        let initial_size = window.inner_size();
-        let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            raw_window_handle,
-            NonZeroU32::new(initial_size.width.max(1)).unwrap(),
-            NonZeroU32::new(initial_size.height.max(1)).unwrap(),
+        let surfaces: Vec<_> = windows
+            .iter()
+            .map(|window| create_surface(&gl_config, window))
+            .collect();
+
+        let gl_context = Rc::new(
+            not_current_gl_context
+                .make_current(&surfaces[0])
+                .expect("Failed to make GL context current"),
         );
 
-        let gl_surface = unsafe {
+        let outputs = windows
+            .into_iter()
+            .zip(surfaces)
+            .map(|(window, surface)| GlOutput::new(window, surface, gl_context.clone(), &gl_config))
+            .collect();
+
+        run_screens(event_loop, outputs);
+    }
+
+    fn create_surface(gl_config: &Config, window: &Window) -> Surface<WindowSurface> {
+        let size = window.inner_size();
+        let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            window.raw_window_handle(),
+            NonZeroU32::new(size.width.max(1)).unwrap(),
+            NonZeroU32::new(size.height.max(1)).unwrap(),
+        );
+        unsafe {
             gl_config
                 .display()
-                .create_window_surface(&gl_config, &surface_attributes)
+                .create_window_surface(gl_config, &surface_attributes)
                 .expect("Failed to create GL surface")
-        };
+        }
+    }
 
-        let gl_context = not_current_gl_context
-            .make_current(&gl_surface)
-            .expect("Failed to make GL context current");
+    struct GlOutput {
+        // Field order matters: GL resources go before the context and window.
+        canvas: Canvas<OpenGl>,
+        surface: Surface<WindowSurface>,
+        context: Rc<PossiblyCurrentContext>,
+        window: Window,
+    }
 
-        let renderer = unsafe {
-            OpenGl::new_from_function_cstr(|symbol| gl_config.display().get_proc_address(symbol))
+    impl GlOutput {
+        fn new(
+            window: Window,
+            surface: Surface<WindowSurface>,
+            context: Rc<PossiblyCurrentContext>,
+            gl_config: &Config,
+        ) -> Self {
+            context
+                .make_current(&surface)
+                .expect("Failed to make GL context current");
+            // With several windows sharing one context, waiting for vblank on
+            // every swap would stall the frame loop once per monitor. Pacing
+            // is done by FRAME_INTERVAL instead.
+            let _ = surface.set_swap_interval(&context, SwapInterval::DontWait);
+
+            let renderer = unsafe {
+                OpenGl::new_from_function_cstr(|symbol| {
+                    gl_config.display().get_proc_address(symbol)
+                })
                 .expect("Failed to create renderer")
-        };
-        let mut canvas = Canvas::new(renderer).expect("Failed to create canvas");
+            };
+            let canvas = Canvas::new(renderer).expect("Failed to create canvas");
 
-        resize_canvas(&mut canvas, initial_size);
-        window.set_cursor_visible(window.fullscreen().is_none());
+            Self {
+                canvas,
+                surface,
+                context,
+                window,
+            }
+        }
 
-        let mut state = AppState {
-            scene: goop::Scene::new(initial_size.width as f64, initial_size.height as f64),
-        };
-        let mut next_tick = Instant::now();
-
-        event_loop
-            .run(move |event, elwt| {
-                elwt.set_control_flow(ControlFlow::WaitUntil(next_tick));
-
-                match event {
-                    Event::WindowEvent { event, .. } => match event {
-                        WindowEvent::CloseRequested => elwt.exit(),
-                        WindowEvent::Resized(size) => {
-                            resize_surface(&gl_surface, &gl_context, size);
-                            resize_canvas(&mut canvas, size);
-                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
-                            window.set_cursor_visible(window.fullscreen().is_none());
-                            window.request_redraw();
-                        }
-                        WindowEvent::ScaleFactorChanged {
-                            mut inner_size_writer,
-                            ..
-                        } => {
-                            let size = window.inner_size();
-                            let _ = inner_size_writer.request_inner_size(size);
-                            resize_surface(&gl_surface, &gl_context, size);
-                            resize_canvas(&mut canvas, size);
-                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
-                            window.set_cursor_visible(window.fullscreen().is_none());
-                            window.request_redraw();
-                        }
-                        WindowEvent::KeyboardInput { event, .. } => {
-                            if is_key_press(&event) {
-                                elwt.exit();
-                            }
-                        }
-                        WindowEvent::MouseInput {
-                            state: ElementState::Pressed,
-                            ..
-                        } => elwt.exit(),
-                        WindowEvent::RedrawRequested => {
-                            state.scene.advance();
-                            let size = window.inner_size();
-                            draw_scene(&mut canvas, &state.scene, size);
-                            canvas.flush();
-                            gl_surface.swap_buffers(&gl_context).ok();
-                            next_tick = Instant::now() + FRAME_INTERVAL;
-                        }
-                        _ => {}
-                    },
-                    Event::NewEvents(StartCause::ResumeTimeReached { .. })
-                    | Event::NewEvents(StartCause::Init) => {
-                        window.request_redraw();
-                    }
-                    _ => {}
-                }
-            })
-            .expect("Event loop error");
+        fn make_current(&self) {
+            self.context
+                .make_current(&self.surface)
+                .expect("Failed to make GL context current");
+        }
     }
 
-    fn resize_surface(
-        gl_surface: &glutin::surface::Surface<WindowSurface>,
-        gl_context: &glutin::context::PossiblyCurrentContext,
-        size: PhysicalSize<u32>,
-    ) {
-        let width = NonZeroU32::new(size.width.max(1)).unwrap();
-        let height = NonZeroU32::new(size.height.max(1)).unwrap();
-        gl_surface.resize(gl_context, width, height);
-    }
+    impl Output for GlOutput {
+        fn window(&self) -> &Window {
+            &self.window
+        }
 
-    fn resize_canvas(canvas: &mut Canvas<OpenGl>, size: PhysicalSize<u32>) {
-        canvas.set_size(size.width, size.height, 1.0);
+        fn resize(&mut self, size: PhysicalSize<u32>) {
+            self.make_current();
+            let width = NonZeroU32::new(size.width.max(1)).unwrap();
+            let height = NonZeroU32::new(size.height.max(1)).unwrap();
+            self.surface.resize(&self.context, width, height);
+        }
+
+        fn render(&mut self, scene: &goop::Scene) {
+            self.make_current();
+            let size = self.window.inner_size();
+            // femtovg only applies the GL viewport in set_size, and the
+            // viewport is context state shared by all windows, so it has to
+            // be set again before every frame.
+            self.canvas.set_size(size.width, size.height, 1.0);
+            draw_scene(&mut self.canvas, scene, size);
+            self.canvas.flush();
+            self.surface.swap_buffers(&self.context).ok();
+        }
     }
 
     fn draw_scene(canvas: &mut Canvas<OpenGl>, scene: &goop::Scene, size: PhysicalSize<u32>) {
@@ -547,6 +669,20 @@ mod cpu_renderer {
     use super::*;
 
     use tiny_skia::{Color, FillRule, Paint, PathBuilder, PixmapMut, Transform};
+
+    /// One fullscreen window per monitor.
+    pub fn create_windows(event_loop: &EventLoop<()>) -> Vec<Window> {
+        monitors(event_loop)
+            .into_iter()
+            .map(|monitor| {
+                let window = window_builder(&monitor)
+                    .build(event_loop)
+                    .expect("Failed to create window");
+                enter_fullscreen(&window, monitor);
+                window
+            })
+            .collect()
+    }
 
     pub fn draw_scene(pixmap: &mut PixmapMut<'_>, scene: &goop::Scene) {
         pixmap.fill(Color::BLACK);
@@ -598,115 +734,68 @@ mod softbuffer_app {
     use std::rc::Rc;
     use tiny_skia::Pixmap;
 
-    use crate::cpu_renderer::draw_scene;
+    use crate::cpu_renderer::{create_windows, draw_scene};
 
     pub fn run() {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
-        let window = WindowBuilder::new()
-            .with_title("Goop")
-            .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
-            .with_fullscreen(Some(Fullscreen::Borderless(None)))
-            .build(&event_loop)
-            .expect("Failed to create window");
-        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        window.set_cursor_visible(window.fullscreen().is_none());
-        let window = Rc::new(window);
+        let outputs = create_windows(&event_loop)
+            .into_iter()
+            .map(SoftbufferOutput::new)
+            .collect();
+        run_screens(event_loop, outputs);
+    }
 
-        let mut state = AppState {
-            scene: goop::Scene::new(
-                window.inner_size().width as f64,
-                window.inner_size().height as f64,
-            ),
-        };
+    struct SoftbufferOutput {
+        surface: Surface<Rc<Window>, Rc<Window>>,
+        _context: Context<Rc<Window>>,
+        pixmap: Pixmap,
+        window: Rc<Window>,
+    }
 
-        let context = Context::new(window.clone()).expect("Failed to create softbuffer context");
-        let mut surface = Surface::new(&context, window.clone()).expect("Failed to create surface");
+    impl SoftbufferOutput {
+        fn new(window: Window) -> Self {
+            let window = Rc::new(window);
+            let context =
+                Context::new(window.clone()).expect("Failed to create softbuffer context");
+            let surface = Surface::new(&context, window.clone()).expect("Failed to create surface");
+            let size = window.inner_size();
+            let mut output = Self {
+                surface,
+                _context: context,
+                pixmap: Pixmap::new(1, 1).unwrap(),
+                window,
+            };
+            output.resize(size);
+            output
+        }
+    }
 
-        let mut size = window.inner_size();
-        surface
-            .resize(
-                NonZeroU32::new(size.width.max(1)).unwrap(),
-                NonZeroU32::new(size.height.max(1)).unwrap(),
-            )
-            .expect("Failed to resize surface");
-        let mut pixmap =
-            Pixmap::new(size.width.max(1), size.height.max(1)).expect("Failed to create pixmap");
+    impl Output for SoftbufferOutput {
+        fn window(&self) -> &Window {
+            &self.window
+        }
 
-        let mut next_tick = Instant::now();
+        fn resize(&mut self, size: PhysicalSize<u32>) {
+            self.surface
+                .resize(
+                    NonZeroU32::new(size.width.max(1)).unwrap(),
+                    NonZeroU32::new(size.height.max(1)).unwrap(),
+                )
+                .expect("Failed to resize surface");
+            self.pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
+                .expect("Failed to create pixmap");
+        }
 
-        event_loop
-            .run(move |event, elwt| {
-                elwt.set_control_flow(ControlFlow::WaitUntil(next_tick));
+        fn render(&mut self, scene: &goop::Scene) {
+            draw_scene(&mut self.pixmap.as_mut(), scene);
 
-                match event {
-                    Event::WindowEvent { event, .. } => match event {
-                        WindowEvent::CloseRequested => elwt.exit(),
-                        WindowEvent::Resized(new_size) => {
-                            size = new_size;
-                            surface
-                                .resize(
-                                    NonZeroU32::new(size.width.max(1)).unwrap(),
-                                    NonZeroU32::new(size.height.max(1)).unwrap(),
-                                )
-                                .expect("Failed to resize surface");
-                            pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
-                                .expect("Failed to create pixmap");
-                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
-                            window.set_cursor_visible(window.fullscreen().is_none());
-                            window.request_redraw();
-                        }
-                        WindowEvent::ScaleFactorChanged {
-                            mut inner_size_writer,
-                            ..
-                        } => {
-                            let new_size = window.inner_size();
-                            let _ = inner_size_writer.request_inner_size(new_size);
-                            size = new_size;
-                            surface
-                                .resize(
-                                    NonZeroU32::new(size.width.max(1)).unwrap(),
-                                    NonZeroU32::new(size.height.max(1)).unwrap(),
-                                )
-                                .expect("Failed to resize surface");
-                            pixmap = Pixmap::new(size.width.max(1), size.height.max(1))
-                                .expect("Failed to create pixmap");
-                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
-                            window.set_cursor_visible(window.fullscreen().is_none());
-                            window.request_redraw();
-                        }
-                        WindowEvent::KeyboardInput { event, .. } => {
-                            if is_key_press(&event) {
-                                elwt.exit();
-                            }
-                        }
-                        WindowEvent::MouseInput {
-                            state: ElementState::Pressed,
-                            ..
-                        } => elwt.exit(),
-                        WindowEvent::RedrawRequested => {
-                            state.scene.advance();
-
-                            let mut canvas = pixmap.as_mut();
-                            draw_scene(&mut canvas, &state.scene);
-
-                            let mut buffer = surface
-                                .buffer_mut()
-                                .expect("Failed to get softbuffer buffer");
-                            blit_pixmap_to_buffer(&pixmap, &mut buffer);
-                            buffer.present().expect("Failed to present buffer");
-
-                            next_tick = Instant::now() + FRAME_INTERVAL;
-                        }
-                        _ => {}
-                    },
-                    Event::NewEvents(StartCause::ResumeTimeReached { .. })
-                    | Event::NewEvents(StartCause::Init) => {
-                        window.request_redraw();
-                    }
-                    _ => {}
-                }
-            })
-            .expect("Event loop error");
+            let mut buffer = self
+                .surface
+                .buffer_mut()
+                .expect("Failed to get softbuffer buffer");
+            blit_pixmap_to_buffer(&self.pixmap, &mut buffer);
+            buffer.present().expect("Failed to present buffer");
+        }
     }
 
     fn blit_pixmap_to_buffer(pixmap: &Pixmap, buffer: &mut [u32]) {
@@ -727,91 +816,60 @@ mod pixels_app {
     use pixels::{Pixels, SurfaceTexture};
     use tiny_skia::PixmapMut;
 
-    use crate::cpu_renderer::draw_scene;
+    use crate::cpu_renderer::{create_windows, draw_scene};
 
     pub fn run() {
         let event_loop = EventLoop::new().expect("Failed to create event loop");
-        let window = WindowBuilder::new()
-            .with_title("Goop")
-            .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
-            .with_fullscreen(Some(Fullscreen::Borderless(None)))
-            .build(&event_loop)
-            .expect("Failed to create window");
-        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        window.set_cursor_visible(window.fullscreen().is_none());
+        let outputs = create_windows(&event_loop)
+            .into_iter()
+            .map(PixelsOutput::new)
+            .collect();
+        run_screens(event_loop, outputs);
+    }
 
-        let mut state = AppState {
-            scene: goop::Scene::new(
-                window.inner_size().width as f64,
-                window.inner_size().height as f64,
-            ),
-        };
+    struct PixelsOutput {
+        pixels: Pixels,
+        size: PhysicalSize<u32>,
+        window: Window,
+    }
 
-        let mut size = window.inner_size();
-        let surface_texture = SurfaceTexture::new(size.width.max(1), size.height.max(1), &window);
-        let mut pixels = Pixels::new(size.width.max(1), size.height.max(1), surface_texture)
-            .expect("Failed to create Pixels surface");
+    impl PixelsOutput {
+        fn new(window: Window) -> Self {
+            let size = window.inner_size();
+            let surface_texture =
+                SurfaceTexture::new(size.width.max(1), size.height.max(1), &window);
+            let pixels = Pixels::new(size.width.max(1), size.height.max(1), surface_texture)
+                .expect("Failed to create Pixels surface");
+            Self {
+                pixels,
+                size,
+                window,
+            }
+        }
+    }
 
-        let mut next_tick = Instant::now();
+    impl Output for PixelsOutput {
+        fn window(&self) -> &Window {
+            &self.window
+        }
 
-        event_loop
-            .run(move |event, elwt| {
-                elwt.set_control_flow(ControlFlow::WaitUntil(next_tick));
+        fn resize(&mut self, size: PhysicalSize<u32>) {
+            self.size = size;
+            let _ = self
+                .pixels
+                .resize_surface(size.width.max(1), size.height.max(1));
+            let _ = self
+                .pixels
+                .resize_buffer(size.width.max(1), size.height.max(1));
+        }
 
-                match event {
-                    Event::WindowEvent { event, .. } => match event {
-                        WindowEvent::CloseRequested => elwt.exit(),
-                        WindowEvent::Resized(new_size) => {
-                            size = new_size;
-                            let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
-                            let _ = pixels.resize_buffer(size.width.max(1), size.height.max(1));
-                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
-                            window.set_cursor_visible(window.fullscreen().is_none());
-                            window.request_redraw();
-                        }
-                        WindowEvent::ScaleFactorChanged {
-                            mut inner_size_writer,
-                            ..
-                        } => {
-                            let new_size = window.inner_size();
-                            let _ = inner_size_writer.request_inner_size(new_size);
-                            size = new_size;
-                            let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
-                            let _ = pixels.resize_buffer(size.width.max(1), size.height.max(1));
-                            state.scene = goop::Scene::new(size.width as f64, size.height as f64);
-                            window.set_cursor_visible(window.fullscreen().is_none());
-                            window.request_redraw();
-                        }
-                        WindowEvent::KeyboardInput { event, .. } => {
-                            if is_key_press(&event) {
-                                elwt.exit();
-                            }
-                        }
-                        WindowEvent::MouseInput {
-                            state: ElementState::Pressed,
-                            ..
-                        } => elwt.exit(),
-                        WindowEvent::RedrawRequested => {
-                            state.scene.advance();
-
-                            let frame = pixels.frame_mut();
-                            if let Some(mut pixmap) =
-                                PixmapMut::from_bytes(frame, size.width.max(1), size.height.max(1))
-                            {
-                                draw_scene(&mut pixmap, &state.scene);
-                            }
-                            pixels.render().expect("Pixels render failed");
-                            next_tick = Instant::now() + FRAME_INTERVAL;
-                        }
-                        _ => {}
-                    },
-                    Event::NewEvents(StartCause::ResumeTimeReached { .. })
-                    | Event::NewEvents(StartCause::Init) => {
-                        window.request_redraw();
-                    }
-                    _ => {}
-                }
-            })
-            .expect("Event loop error");
+        fn render(&mut self, scene: &goop::Scene) {
+            let (width, height) = (self.size.width.max(1), self.size.height.max(1));
+            if let Some(mut pixmap) = PixmapMut::from_bytes(self.pixels.frame_mut(), width, height)
+            {
+                draw_scene(&mut pixmap, scene);
+            }
+            self.pixels.render().expect("Pixels render failed");
+        }
     }
 }
