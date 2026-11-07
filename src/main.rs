@@ -93,6 +93,9 @@ mod goop {
         slot: usize,
         /// Offsets the blob's wobble while in formation.
         phase: f64,
+        /// Where the blob roamed before getting into formation, to go back
+        /// there afterwards.
+        home: (f64, f64),
     }
 
     impl Blob {
@@ -110,9 +113,10 @@ mod goop {
                 .map(|_| (rng::unit() * mid + mid / 2.0) * rng::sign())
                 .collect();
 
+            let (x, y) = (rng::unit() * maxx, rng::unit() * maxy);
             Self {
-                x: rng::unit() * maxx,
-                y: rng::unit() * maxy,
+                x,
+                y,
                 dx: rng::unit() * max_velocity * rng::sign(),
                 dy: rng::unit() * max_velocity * rng::sign(),
                 torque,
@@ -125,6 +129,7 @@ mod goop {
                 scale: 1.0,
                 slot: 0,
                 phase: TAU * rng::unit(),
+                home: (x, y),
             }
         }
 
@@ -232,7 +237,8 @@ mod goop {
     /// How the blobs are arranged.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub enum Formation {
-        /// Regular goop: the blobs roam the whole screen.
+        /// Regular goop: the blobs roam the whole screen, after going back
+        /// to where they were before getting into formation.
         Free,
         /// Small blobs in a circle around the center, while typing.
         Ring,
@@ -257,6 +263,7 @@ mod goop {
     const TURN_FRAMES: u32 = 4;
     const FADE_FRAMES: u32 = 10;
     const MAX_BURST_FRAMES: u32 = 60;
+    const RETURN_FRAMES: u32 = 10;
 
     pub struct Scene {
         pub layers: Vec<Layer>,
@@ -276,6 +283,8 @@ mod goop {
         pending_turns: u32,
         /// Frames until the next pending turn may start.
         turn_cooldown: u32,
+        /// Whether the blobs are on their way back from a formation.
+        returning: bool,
     }
 
     impl Scene {
@@ -330,6 +339,7 @@ mod goop {
                 spinning: false,
                 pending_turns: 0,
                 turn_cooldown: 0,
+                returning: false,
             }
         }
 
@@ -376,6 +386,12 @@ mod goop {
             if formation == self.formation {
                 return;
             }
+            if self.formation == Formation::Free {
+                for blob in self.blobs_mut() {
+                    blob.home = (blob.x, blob.y);
+                }
+            }
+            self.returning = formation == Formation::Free;
             let (cx, cy) = self.center();
             match formation {
                 Formation::Free => {}
@@ -465,6 +481,16 @@ mod goop {
             };
 
             match self.formation {
+                Formation::Free if self.returning && self.frame <= RETURN_FRAMES => {
+                    for blob in self.blobs_mut() {
+                        let (x, y) = blob.home;
+                        blob.throb();
+                        blob.spin();
+                        // Back within ~10 frames (0.3 s), as fast as they
+                        // gathered.
+                        blob.follow(x, y, 1.0, 0.4);
+                    }
+                }
                 Formation::Free => {
                     for blob in self.blobs_mut() {
                         blob.throb();
