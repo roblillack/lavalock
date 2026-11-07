@@ -2,6 +2,13 @@
 name = "lavalock"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A screen locker for Wayland and X11 with colorful drifting blobs"
+license = "MIT"
+repository = "https://github.com/roblillack/lavalock"
+readme = "README.md"
+keywords = ["screenlocker", "wayland", "x11", "screensaver", "lock"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 bytemuck = { version = "1", optional = true }
