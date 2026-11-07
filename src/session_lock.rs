@@ -501,10 +501,7 @@ impl KeyboardHandler for App {
         let input = match event.keysym {
             Keysym::Return | Keysym::KP_Enter => Input::Submit,
             Keysym::Escape | Keysym::BackSpace => Input::Clear,
-            _ => match &event.utf8 {
-                Some(text) => Input::Text(text),
-                None => return,
-            },
+            _ => event.utf8.as_deref().map_or(Input::Other, Input::Text),
         };
         let scenes = self.screens.iter_mut().filter_map(|s| s.scene.as_mut());
         self.lock.input(input, scenes);

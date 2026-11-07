@@ -1299,6 +1299,8 @@ enum Input<'a> {
     /// Forget what was typed so far.
     Clear,
     Text(&'a str),
+    /// Any other key, e.g. Ctrl or Tab.
+    Other,
 }
 
 impl Input<'_> {
@@ -1309,7 +1311,7 @@ impl Input<'_> {
         match &event.logical_key {
             Key::Named(NamedKey::Enter) => Some(Input::Submit),
             Key::Named(NamedKey::Escape | NamedKey::Backspace) => Some(Input::Clear),
-            _ => event.text.as_deref().map(Input::Text),
+            _ => Some(event.text.as_deref().map_or(Input::Other, Input::Text)),
         }
     }
 }
@@ -1351,6 +1353,24 @@ impl Idle {
     }
 }
 
+/// Brings up the ring on every screen, so it's clear where the password
+/// goes, and turns it `turns` further where it's already up.
+///
+/// The turns are random, so that onlookers can't count the keys: 0-3 while
+/// gathering into the ring, 1-4 afterwards for keys that typed something.
+/// The same on every screen, or comparing screens would give the count away.
+fn show_key(scenes: &mut [&mut goop::Scene], turns: u32) {
+    let gathering_turns = rng::range(4) as u32;
+    for scene in scenes {
+        if scene.formation() == goop::Formation::Ring {
+            scene.nudge(turns);
+        } else {
+            scene.set_formation(goop::Formation::Ring);
+            scene.nudge(gathering_turns);
+        }
+    }
+}
+
 /// Password entry, and what the screens show for it.
 struct Lock {
     auth: auth::Authenticator,
@@ -1377,6 +1397,7 @@ impl Lock {
         if self.checking.is_some() || self.unlocking {
             return;
         }
+        let mut scenes: Vec<_> = scenes.into_iter().collect();
         match input {
             Input::Submit => {
                 if !self.password.is_empty() {
@@ -1388,6 +1409,15 @@ impl Lock {
                 }
             }
             Input::Clear => {
+                // Like any key, bring up the ring first. Once it's up, go
+                // back to roaming freely.
+                if !scenes
+                    .iter()
+                    .any(|s| s.formation() == goop::Formation::Ring)
+                {
+                    show_key(&mut scenes, 0);
+                    return;
+                }
                 self.password.clear();
                 self.typing = false;
                 for scene in scenes {
@@ -1396,31 +1426,20 @@ impl Lock {
             }
             Input::Text(text) => {
                 // People tend to press space to wake the screen before
-                // typing their password, so ignore it as the first key.
-                if !std::mem::replace(&mut self.typing, true) && text == " " {
-                    return;
-                }
-                let mut typed = false;
-                for ch in text.chars().filter(|c| !c.is_control()) {
-                    typed |= self.password.push(ch);
-                }
-                if typed {
-                    // A random number of turns per key, so that onlookers
-                    // can't count the keys: 0-3 while gathering into the
-                    // ring, 1-4 afterwards. The same on every screen, or
-                    // comparing screens would give the count away.
-                    let gathering_turns = rng::range(4) as u32;
-                    let turns = 1 + rng::range(4) as u32;
-                    for scene in scenes {
-                        if scene.formation() == goop::Formation::Ring {
-                            scene.nudge(turns);
-                        } else {
-                            scene.set_formation(goop::Formation::Ring);
-                            scene.nudge(gathering_turns);
-                        }
+                // typing their password, so leave it out as the first key,
+                // but let the screens show it like any other.
+                let swallow = !self.typing && text == " ";
+                let mut typed = swallow;
+                if !swallow {
+                    for ch in text.chars().filter(|c| !c.is_control()) {
+                        typed |= self.password.push(ch);
                     }
                 }
+                self.typing |= typed;
+                let turns = if typed { 1 + rng::range(4) as u32 } else { 0 };
+                show_key(&mut scenes, turns);
             }
+            Input::Other => show_key(&mut scenes, 0),
         }
     }
 
