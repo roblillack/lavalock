@@ -1,5 +1,7 @@
 # lavalock
 
+[![crates.io](https://img.shields.io/crates/v/lavalock.svg)](https://crates.io/crates/lavalock)
+
 A screen locker that shows colorful blobs drifting across the screen. It
 mimics the "Goop" hack (`hacks/goop.c`) from Jamie Zawinski's
 [XScreenSaver](https://www.jwz.org/xscreensaver/), in its opaque mode as
@@ -7,6 +9,15 @@ seen on OpenBSD/xenocara.
 
 Runs on Wayland (via `ext-session-lock`) and X11, and unlocks with the user's
 password (PAM, or BSD Authentication on OpenBSD).
+
+## Installation
+
+    cargo install lavalock
+
+On OpenBSD, BSD Authentication requires lavalock to be setgid `auth`:
+
+    doas chown root:auth ~/.cargo/bin/lavalock
+    doas chmod 2555 ~/.cargo/bin/lavalock
 
 ## Build
 
