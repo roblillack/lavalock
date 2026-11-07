@@ -1014,6 +1014,11 @@ mod grab {
             }))
         }
 
+        /// Whether we got hold of the keyboard and pointer by now.
+        pub fn grabbed(&self) -> bool {
+            self.grabbed
+        }
+
         /// Grabs input, if it's time to. Fails if we couldn't grab it in time
         /// at startup.
         pub fn update(&mut self) -> Result<(), &'static str> {
@@ -1168,6 +1173,77 @@ fn window_builder(monitor: &Option<MonitorHandle>) -> WindowBuilder {
 fn enter_fullscreen(window: &Window, monitor: &Option<MonitorHandle>) {
     window.set_fullscreen(Some(Fullscreen::Borderless(monitor.clone())));
     window.set_cursor_visible(window.fullscreen().is_none());
+}
+
+/// Going to the background once locked, so whoever started us can carry on,
+/// e.g. suspend the system, knowing the screen is locked.
+mod daemon {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// Where to tell the waiting parent that we're locked, if it waits.
+    static READY: AtomicI32 = AtomicI32::new(-1);
+
+    /// Forks. The parent waits until the child is locked and then exits; or,
+    /// should the child fail before, exits as the child did. Call it before
+    /// starting any threads.
+    pub fn start() -> Result<(), String> {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+            return Err(format!(
+                "cannot create pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let [read_end, write_end] = fds;
+        match unsafe { libc::fork() } {
+            -1 => Err(format!("cannot fork: {}", std::io::Error::last_os_error())),
+            0 => {
+                unsafe {
+                    libc::close(read_end);
+                    libc::setsid();
+                    libc::chdir(c"/".as_ptr());
+                }
+                READY.store(write_end, Ordering::Relaxed);
+                Ok(())
+            }
+            child => {
+                unsafe { libc::close(write_end) };
+                let mut byte = 0u8;
+                let n = loop {
+                    let n = unsafe { libc::read(read_end, (&raw mut byte).cast(), 1) };
+                    if n != -1
+                        || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                    {
+                        break n;
+                    }
+                };
+                if n == 1 {
+                    std::process::exit(0);
+                }
+                // The child exited without locking.
+                let mut status = 0;
+                let code = if unsafe { libc::waitpid(child, &mut status, 0) } == child
+                    && libc::WIFEXITED(status)
+                {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    1
+                };
+                std::process::exit(code);
+            }
+        }
+    }
+
+    /// Lets the parent exit, if it waits for us.
+    pub fn ready() {
+        let fd = READY.swap(-1, Ordering::Relaxed);
+        if fd != -1 {
+            unsafe {
+                libc::write(fd, [1u8].as_ptr().cast(), 1);
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 /// Draws scenes, into a window or a Wayland surface.
@@ -1459,6 +1535,9 @@ fn run_screens<O: Output>(
                         // Better not to lock at all than to only look locked.
                         grab.update().unwrap_or_else(|err| fail(err));
                     }
+                    if grab.as_ref().is_none_or(|grab| grab.grabbed()) {
+                        daemon::ready();
+                    }
                     lock.poll(screens.iter_mut().map(|s| &mut s.scene));
                     if let Some((idle, dpms)) = &mut idle {
                         if idle.expired() {
@@ -1490,8 +1569,10 @@ fn fail(err: &str) -> ! {
 }
 
 const USAGE: &str = "\
-usage: lavalock [-d seconds]
+usage: lavalock [-n] [-d seconds]
 
+  -n, --nofork               stay in the foreground until unlocked, instead
+                             of going to the background once locked
   -d, --display-off seconds  turn the displays off after this long without
                              input (0, the default, never does)";
 
@@ -1500,6 +1581,8 @@ usage: lavalock [-d seconds]
 struct Options {
     /// How long to wait for input before turning the displays off.
     display_off: Option<Duration>,
+    /// Whether to go to the background once locked.
+    daemonize: bool,
 }
 
 impl Options {
@@ -1508,7 +1591,10 @@ impl Options {
             eprintln!("{USAGE}");
             std::process::exit(2);
         };
-        let mut options = Self { display_off: None };
+        let mut options = Self {
+            display_off: None,
+            daemonize: true,
+        };
         let mut args = std::env::args_os().skip(1);
         while let Some(arg) = args.next() {
             match arg.to_str() {
@@ -1516,6 +1602,7 @@ impl Options {
                     println!("{USAGE}");
                     std::process::exit(0);
                 }
+                Some("-n" | "--nofork") => options.daemonize = false,
                 Some("-d" | "--display-off") => {
                     let seconds: u64 = args
                         .next()
@@ -1539,6 +1626,9 @@ use softbuffer_app as renderer;
 
 fn main() {
     let options = Options::parse();
+    if options.daemonize {
+        daemon::start().unwrap_or_else(|err| fail(&err));
+    }
     // Make sure we'll be able to unlock before locking.
     let auth = auth::Authenticator::new().unwrap_or_else(|err| fail(&err));
 

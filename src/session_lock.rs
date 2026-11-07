@@ -37,7 +37,7 @@ use wayland_protocols_wlr::output_power_management::v1::client::{
 };
 use winit::dpi::PhysicalSize;
 
-use crate::{FRAME_INTERVAL, Idle, Input, Lock, Options, Output, auth, fail, goop};
+use crate::{FRAME_INTERVAL, Idle, Input, Lock, Options, Output, auth, daemon, fail, goop};
 
 /// A connection to a compositor that can lock the session.
 pub struct Session {
@@ -340,6 +340,7 @@ impl App {
 impl SessionLockHandler for App {
     fn locked(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
         self.locked = true;
+        daemon::ready();
     }
 
     fn finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: SessionLock) {
