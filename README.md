@@ -25,6 +25,9 @@ The default renderer uses OpenGL. CPU renderers are available with
 - `-d`, `--display-off` turns the displays off after that many seconds
   without input.
 
+A space typed as the first key of the password is ignored, so that pressing
+space to wake the screen doesn't end up in the password.
+
 To lock after 3 minutes of inactivity, with the displays turning off 5
 minutes later, and before the system suspends, use
 [swayidle](https://github.com/swaywm/swayidle):

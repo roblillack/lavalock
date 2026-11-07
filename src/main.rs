@@ -1358,6 +1358,8 @@ struct Lock {
     /// The pending result while a password is being checked.
     checking: Option<Receiver<bool>>,
     unlocking: bool,
+    /// Whether a key was typed since the password was last emptied.
+    typing: bool,
 }
 
 impl Lock {
@@ -1367,6 +1369,7 @@ impl Lock {
             password: auth::Password::new(),
             checking: None,
             unlocking: false,
+            typing: false,
         }
     }
 
@@ -1378,6 +1381,7 @@ impl Lock {
             Input::Submit => {
                 if !self.password.is_empty() {
                     self.checking = Some(self.auth.check(self.password.take()));
+                    self.typing = false;
                     for scene in scenes {
                         scene.set_spinning(true);
                     }
@@ -1385,11 +1389,17 @@ impl Lock {
             }
             Input::Clear => {
                 self.password.clear();
+                self.typing = false;
                 for scene in scenes {
                     scene.set_formation(goop::Formation::Free);
                 }
             }
             Input::Text(text) => {
+                // People tend to press space to wake the screen before
+                // typing their password, so ignore it as the first key.
+                if !std::mem::replace(&mut self.typing, true) && text == " " {
+                    return;
+                }
                 let mut typed = false;
                 for ch in text.chars().filter(|c| !c.is_control()) {
                     typed |= self.password.push(ch);
