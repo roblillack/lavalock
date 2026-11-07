@@ -158,9 +158,10 @@ mod goop {
                 ra += rng::unit() * self.elasticity * dir_strict;
                 let mut r = ra * dir_nonneg;
 
-                if (ra > self.max_r && r >= 0.0) || (ra < self.min_r && r < 0.0) {
-                    r = -r;
-                } else if rng::range(50) == 0 {
+                if (ra > self.max_r && r >= 0.0)
+                    || (ra < self.min_r && r < 0.0)
+                    || rng::range(50) == 0
+                {
                     r = -r;
                 }
 
