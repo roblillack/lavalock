@@ -26,7 +26,8 @@ The default renderer uses OpenGL. CPU renderers are available with
   without input.
 
 A space typed as the first key of the password is ignored, so that pressing
-space to wake the screen doesn't end up in the password.
+space to wake the screen doesn't end up in the password. What was typed is
+forgotten after 5 seconds without a key press.
 
 To lock after 3 minutes of inactivity, with the displays turning off 5
 minutes later, and before the system suspends, use

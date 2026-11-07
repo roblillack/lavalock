@@ -1371,6 +1371,9 @@ fn show_key(scenes: &mut [&mut goop::Scene], turns: u32) {
     }
 }
 
+/// How long to wait for the next key before forgetting what was typed.
+const TYPING_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Password entry, and what the screens show for it.
 struct Lock {
     auth: auth::Authenticator,
@@ -1380,6 +1383,8 @@ struct Lock {
     unlocking: bool,
     /// Whether a key was typed since the password was last emptied.
     typing: bool,
+    /// When the last key was pressed, while waiting for the next one.
+    last_key: Option<Instant>,
 }
 
 impl Lock {
@@ -1390,6 +1395,7 @@ impl Lock {
             checking: None,
             unlocking: false,
             typing: false,
+            last_key: None,
         }
     }
 
@@ -1398,11 +1404,13 @@ impl Lock {
             return;
         }
         let mut scenes: Vec<_> = scenes.into_iter().collect();
+        self.last_key = Some(Instant::now());
         match input {
             Input::Submit => {
                 if !self.password.is_empty() {
                     self.checking = Some(self.auth.check(self.password.take()));
                     self.typing = false;
+                    self.last_key = None;
                     for scene in scenes {
                         scene.set_spinning(true);
                     }
@@ -1418,11 +1426,7 @@ impl Lock {
                     show_key(&mut scenes, 0);
                     return;
                 }
-                self.password.clear();
-                self.typing = false;
-                for scene in scenes {
-                    scene.set_formation(goop::Formation::Free);
-                }
+                self.clear(scenes);
             }
             Input::Text(text) => {
                 // People tend to press space to wake the screen before
@@ -1443,8 +1447,26 @@ impl Lock {
         }
     }
 
-    /// Picks up the result of a password check, if there is one by now.
+    /// Forgets what was typed so far, and lets the blobs roam freely again.
+    fn clear<'a>(&mut self, scenes: impl IntoIterator<Item = &'a mut goop::Scene>) {
+        self.password.clear();
+        self.typing = false;
+        self.last_key = None;
+        for scene in scenes {
+            scene.set_formation(goop::Formation::Free);
+        }
+    }
+
+    /// Picks up the result of a password check, if there is one by now, and
+    /// clears the password once nobody typed for a while.
     fn poll<'a>(&mut self, scenes: impl IntoIterator<Item = &'a mut goop::Scene>) {
+        if self
+            .last_key
+            .is_some_and(|time| time.elapsed() >= TYPING_TIMEOUT)
+        {
+            self.clear(scenes);
+            return;
+        }
         let Some(result) = &self.checking else {
             return;
         };
